@@ -181,6 +181,12 @@ enum SiteCommand {
         site_type: String,
         #[arg(long)]
         domain: Option<String>,
+        #[arg(long, requires = "template_version")]
+        template_id: Option<String>,
+        #[arg(long, requires = "template_id")]
+        template_version: Option<String>,
+        #[arg(long, requires = "template_id")]
+        preset_id: Option<String>,
         #[arg(long)]
         operation_id: Option<Uuid>,
         #[arg(long, default_value_t = 120)]
@@ -403,13 +409,25 @@ fn run_client(command: ClientCommand) -> Result<Value> {
                 name,
                 site_type,
                 domain,
+                template_id,
+                template_version,
+                preset_id,
                 operation_id,
                 wait_seconds,
             } => {
                 let operation = operation_id.unwrap_or_else(Uuid::new_v4);
                 let mut runtime = authenticated_runtime(&auth)?;
-                let payload = json!({"operation_id":operation,"name":name,"site_type":site_type,
+                let mut payload = json!({"operation_id":operation,"name":name,"site_type":site_type,
                     "primary_domain":domain});
+                if let Some(value) = template_id {
+                    payload["template_id"] = json!(value);
+                }
+                if let Some(value) = template_version {
+                    payload["template_version"] = json!(value);
+                }
+                if let Some(value) = preset_id {
+                    payload["preset_id"] = json!(value);
+                }
                 let start = terminal_request(
                     &runtime,
                     "Client.Tenant.Sites.Create",
@@ -790,5 +808,55 @@ mod tests {
             "--code-stdin",
         ]);
         assert!(conflict.is_err());
+    }
+
+    #[test]
+    fn template_selection_requires_id_and_version_and_accepts_a_preset() {
+        let valid = Cli::try_parse_from([
+            "cgeos2",
+            "client",
+            "site",
+            "create",
+            "--base-url",
+            "https://api.example.test",
+            "--phone",
+            "REDACTED_DEBUG_PHONE",
+            "--code",
+            "123456",
+            "--enterprise",
+            "00000000-0000-0000-0000-000000000002",
+            "--name",
+            "Official",
+            "--site-type",
+            "site",
+            "--template-id",
+            "fleks-site",
+            "--template-version",
+            "0.1.0",
+            "--preset-id",
+            "cubegarden-official",
+        ]);
+        assert!(valid.is_ok());
+        let partial = Cli::try_parse_from([
+            "cgeos2",
+            "client",
+            "site",
+            "create",
+            "--base-url",
+            "https://api.example.test",
+            "--phone",
+            "REDACTED_DEBUG_PHONE",
+            "--code",
+            "123456",
+            "--enterprise",
+            "00000000-0000-0000-0000-000000000002",
+            "--name",
+            "Official",
+            "--site-type",
+            "site",
+            "--template-id",
+            "fleks-site",
+        ]);
+        assert!(partial.is_err());
     }
 }

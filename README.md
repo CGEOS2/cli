@@ -39,12 +39,14 @@ cgeos2 client enterprise provision --base-url https://api.example.test \
 # 企业站点：operation-id 可显式传入，超时后用原值重试，不要生成新值
 cgeos2 client site create --base-url https://api.example.test \
   --phone REDACTED_DEBUG_PHONE --code REDACTED_DEBUG_CODE --enterprise <ENTERPRISE_UUID> \
-  --name 'TEST Site' --site-type site --domain site.example.test
+  --name 'TEST Site' --site-type site --domain site.example.test \
+  --template-id fleks-site --template-version 0.1.0 --preset-id cubegarden-official
 
 # Console 已发送 OTP 时复用 challenge；验证码只从 stdin 读取
 printf '%s\n' "$OTP" | cgeos2 client site create --base-url https://api.example.test \
   --challenge <CHALLENGE_UUID> --code-stdin --enterprise <ENTERPRISE_UUID> \
-  --name 'CubeGarden Studio' --site-type site --domain site.example.test
+  --name 'CubeGarden Studio' --site-type site --domain site.example.test \
+  --template-id fleks-site --template-version 0.1.0 --preset-id cubegarden-official
 
 cgeos2 client outpost list --base-url https://api.example.test --phone REDACTED_DEBUG_PHONE --code REDACTED_DEBUG_CODE
 cgeos2 client outpost assign --base-url https://api.example.test --phone REDACTED_DEBUG_PHONE --code REDACTED_DEBUG_CODE \

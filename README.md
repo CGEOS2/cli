@@ -26,6 +26,7 @@ cgeos2 access validate-inquiry --name Agent --contact agent@example.test --messa
 cgeos2 access digest --site-id demo --payload '{"message":"inspect"}'
 
 cgeos2 client login --base-url https://api.example.test --phone REDACTED_DEBUG_PHONE --code REDACTED_DEBUG_CODE
+cgeos2 client challenge --base-url https://api.example.test --phone REDACTED_DEBUG_PHONE
 cgeos2 client build --action Client.Auth.Login.Request --payload '{"username":"tester"}'
 cgeos2 client call --base-url https://api.example.test --phone REDACTED_DEBUG_PHONE --code REDACTED_DEBUG_CODE \
   --action Client.Tenant.Sites.List --enterprise 00000000-0000-0000-0000-000000000001
@@ -40,6 +41,11 @@ cgeos2 client site create --base-url https://api.example.test \
   --phone REDACTED_DEBUG_PHONE --code REDACTED_DEBUG_CODE --enterprise <ENTERPRISE_UUID> \
   --name 'TEST Site' --site-type site --domain site.example.test
 
+# Console 已发送 OTP 时复用 challenge；验证码只从 stdin 读取
+printf '%s\n' "$OTP" | cgeos2 client site create --base-url https://api.example.test \
+  --challenge <CHALLENGE_UUID> --code-stdin --enterprise <ENTERPRISE_UUID> \
+  --name 'CubeGarden Studio' --site-type site --domain site.example.test
+
 cgeos2 client outpost list --base-url https://api.example.test --phone REDACTED_DEBUG_PHONE --code REDACTED_DEBUG_CODE
 cgeos2 client outpost assign --base-url https://api.example.test --phone REDACTED_DEBUG_PHONE --code REDACTED_DEBUG_CODE \
   --enterprise <ENTERPRISE_UUID> --site <SITE_UUID> --node <OUTPOST_UUID> --operation-id <UUID>
@@ -51,6 +57,8 @@ cgeos2 client site publish --base-url https://api.example.test --phone REDACTED_
 `client login` 复用 `client-service` 原生登录流程。CLI 显式启用 `debug-pass` feature，以便
 对接 Portal `--debug-pass` 的固定号码 `REDACTED_DEBUG_PHONE`；该例外只存在 CLI 构建，不会改变默认
 client-service 构建的手机号校验。登录成功后凭据仅保存在当前进程内存，token 不打印。
+`client challenge` 可先生成预签登录挑战；后续联网命令用 `--challenge` 避免重复发送验证码，
+并可用 `--code-stdin` 读取一行 OTP。`--code` 与 `--code-stdin` 冲突，验证码和 token 均不写入输出。
 `client call` 同样只在当前进程保存凭据，并通过该 API origin 的 `/terminal` WSS
 执行一次真实请求；仅可用于获授权的调试环境，服务端业务错误会以非零状态退出。
 企业与站点专用命令复用一次登录连接、持有一个幂等 operation UUID，并轮询持久任务至

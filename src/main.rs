@@ -8,7 +8,7 @@ use cgeos_sdk_shared::native::{Runtime, Status};
 use cgeos_sdk_shared::protocol::{Action, ClientKind, Credentials, Outcome, Request};
 use clap::{Args, Parser, Subcommand};
 use serde_json::{json, Value};
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Read};
 use std::net::ToSocketAddrs;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -77,27 +77,22 @@ struct ClientArgs {
 
 #[derive(Subcommand)]
 enum ClientCommand {
-    /// Request a code and complete native login against one API origin.
-    Login {
+    /// Request an OTP challenge without consuming it; safe to hand to a later command.
+    Challenge {
         #[arg(long)]
         base_url: String,
         #[arg(long)]
         phone: String,
-        #[arg(long)]
-        code: String,
-        #[arg(long, default_value = "cgeos2-cli")]
-        device: String,
+    },
+    /// Request a code and complete native login against one API origin.
+    Login {
+        #[command(flatten)]
+        auth: AuthenticationArgs,
     },
     /// Login and execute one Terminal request against an authorized API origin.
     Call {
-        #[arg(long)]
-        base_url: String,
-        #[arg(long)]
-        phone: String,
-        #[arg(long)]
-        code: String,
-        #[arg(long, default_value = "cgeos2-cli")]
-        device: String,
+        #[command(flatten)]
+        auth: AuthenticationArgs,
         #[arg(long)]
         action: String,
         #[arg(long)]
@@ -133,17 +128,31 @@ enum ClientCommand {
     },
 }
 
+#[derive(Args)]
+struct AuthenticationArgs {
+    #[arg(long)]
+    base_url: String,
+    #[arg(long, required_unless_present = "challenge")]
+    phone: Option<String>,
+    #[arg(
+        long,
+        required_unless_present = "code_stdin",
+        conflicts_with = "code_stdin"
+    )]
+    code: Option<String>,
+    #[arg(long, conflicts_with = "code")]
+    code_stdin: bool,
+    #[arg(long)]
+    challenge: Option<Uuid>,
+    #[arg(long, default_value = "cgeos2-cli")]
+    device: String,
+}
+
 #[derive(Subcommand)]
 enum EnterpriseCommand {
     Provision {
-        #[arg(long)]
-        base_url: String,
-        #[arg(long)]
-        phone: String,
-        #[arg(long)]
-        code: String,
-        #[arg(long, default_value = "cgeos2-cli")]
-        device: String,
+        #[command(flatten)]
+        auth: AuthenticationArgs,
         #[arg(long)]
         name: String,
         #[arg(long)]
@@ -162,14 +171,8 @@ enum EnterpriseCommand {
 #[derive(Subcommand)]
 enum SiteCommand {
     Create {
-        #[arg(long)]
-        base_url: String,
-        #[arg(long)]
-        phone: String,
-        #[arg(long)]
-        code: String,
-        #[arg(long, default_value = "cgeos2-cli")]
-        device: String,
+        #[command(flatten)]
+        auth: AuthenticationArgs,
         #[arg(long)]
         enterprise: Uuid,
         #[arg(long)]
@@ -184,14 +187,8 @@ enum SiteCommand {
         wait_seconds: u64,
     },
     Publish {
-        #[arg(long)]
-        base_url: String,
-        #[arg(long)]
-        phone: String,
-        #[arg(long)]
-        code: String,
-        #[arg(long, default_value = "cgeos2-cli")]
-        device: String,
+        #[command(flatten)]
+        auth: AuthenticationArgs,
         #[arg(long)]
         enterprise: Uuid,
         #[arg(long)]
@@ -210,28 +207,16 @@ enum SiteCommand {
 #[derive(Subcommand)]
 enum OutpostCommand {
     List {
-        #[arg(long)]
-        base_url: String,
-        #[arg(long)]
-        phone: String,
-        #[arg(long)]
-        code: String,
-        #[arg(long, default_value = "cgeos2-cli")]
-        device: String,
+        #[command(flatten)]
+        auth: AuthenticationArgs,
         #[arg(long)]
         enterprise: Option<Uuid>,
         #[arg(long)]
         site: Option<Uuid>,
     },
     Assign {
-        #[arg(long)]
-        base_url: String,
-        #[arg(long)]
-        phone: String,
-        #[arg(long)]
-        code: String,
-        #[arg(long, default_value = "cgeos2-cli")]
-        device: String,
+        #[command(flatten)]
+        auth: AuthenticationArgs,
         #[arg(long)]
         enterprise: Uuid,
         #[arg(long)]
@@ -242,14 +227,8 @@ enum OutpostCommand {
         operation_id: Uuid,
     },
     Unassign {
-        #[arg(long)]
-        base_url: String,
-        #[arg(long)]
-        phone: String,
-        #[arg(long)]
-        code: String,
-        #[arg(long, default_value = "cgeos2-cli")]
-        device: String,
+        #[command(flatten)]
+        auth: AuthenticationArgs,
         #[arg(long)]
         enterprise: Uuid,
         #[arg(long)]
@@ -337,12 +316,7 @@ fn run_access(command: AccessCommand) -> Result<Value> {
 
 fn run_client(command: ClientCommand) -> Result<Value> {
     match command {
-        ClientCommand::Login {
-            base_url,
-            phone,
-            code,
-            device,
-        } => {
+        ClientCommand::Challenge { base_url, phone } => {
             let endpoint = AuthEndpoint::new(&base_url)
                 .map_err(|code| anyhow!("invalid auth endpoint: {code:?}"))?;
             let client = LoginClient::new(endpoint)
@@ -350,9 +324,17 @@ fn run_client(command: ClientCommand) -> Result<Value> {
             let challenge = client
                 .request_code(&phone)
                 .map_err(|code| anyhow!("request code failed: {code:?}"))?;
+            Ok(json!({"challenge": challenge, "expires_by_server_policy": true}))
+        }
+        ClientCommand::Login { auth } => {
+            let endpoint = AuthEndpoint::new(&auth.base_url)
+                .map_err(|code| anyhow!("invalid auth endpoint: {code:?}"))?;
+            let client = LoginClient::new(endpoint)
+                .map_err(|code| anyhow!("cannot create login client: {code:?}"))?;
+            let (challenge, code) = login_material(&client, &auth)?;
             let store = MemoryStore::default();
             let credentials = client
-                .login(&challenge, &code, &device, ClientKind::Web, &store)
+                .login(&challenge, &code, &auth.device, ClientKind::Web, &store)
                 .map_err(|code| anyhow!("login failed: {code:?}"))?;
             Ok(json!({
                 "challenge": challenge,
@@ -365,15 +347,12 @@ fn run_client(command: ClientCommand) -> Result<Value> {
             }))
         }
         ClientCommand::Call {
-            base_url,
-            phone,
-            code,
-            device,
+            auth,
             action,
             enterprise,
             payload,
         } => {
-            let mut runtime = authenticated_runtime(&base_url, &phone, &code, &device)?;
+            let mut runtime = authenticated_runtime(&auth)?;
             let payload: Value = serde_json::from_str(&payload).context("payload must be JSON")?;
             let result = terminal_request(&runtime, &action, enterprise, payload);
             runtime.shutdown();
@@ -385,10 +364,7 @@ fn run_client(command: ClientCommand) -> Result<Value> {
         }
         ClientCommand::Enterprise { command } => match command {
             EnterpriseCommand::Provision {
-                base_url,
-                phone,
-                code,
-                device,
+                auth,
                 name,
                 owner,
                 license_template,
@@ -397,7 +373,7 @@ fn run_client(command: ClientCommand) -> Result<Value> {
                 wait_seconds,
             } => {
                 let operation = operation_id.unwrap_or_else(Uuid::new_v4);
-                let mut runtime = authenticated_runtime(&base_url, &phone, &code, &device)?;
+                let mut runtime = authenticated_runtime(&auth)?;
                 let start = terminal_request(
                     &runtime,
                     "Platform.Enterprise.Provision.Start",
@@ -422,10 +398,7 @@ fn run_client(command: ClientCommand) -> Result<Value> {
         },
         ClientCommand::Site { command } => match command {
             SiteCommand::Create {
-                base_url,
-                phone,
-                code,
-                device,
+                auth,
                 enterprise,
                 name,
                 site_type,
@@ -434,13 +407,14 @@ fn run_client(command: ClientCommand) -> Result<Value> {
                 wait_seconds,
             } => {
                 let operation = operation_id.unwrap_or_else(Uuid::new_v4);
-                let mut runtime = authenticated_runtime(&base_url, &phone, &code, &device)?;
+                let mut runtime = authenticated_runtime(&auth)?;
+                let payload = json!({"operation_id":operation,"name":name,"site_type":site_type,
+                    "primary_domain":domain});
                 let start = terminal_request(
                     &runtime,
                     "Client.Tenant.Sites.Create",
                     Some(enterprise),
-                    json!({"operation_id":operation,"name":name,"site_type":site_type,
-                        "primary_domain":domain}),
+                    payload,
                 );
                 let result = match start {
                     Ok(value) => poll_task(
@@ -457,10 +431,7 @@ fn run_client(command: ClientCommand) -> Result<Value> {
                 result
             }
             SiteCommand::Publish {
-                base_url,
-                phone,
-                code,
-                device,
+                auth,
                 enterprise,
                 site,
                 page,
@@ -471,7 +442,7 @@ fn run_client(command: ClientCommand) -> Result<Value> {
                 if expected_revision < 1 {
                     return Err(anyhow!("expected-revision must be positive"));
                 }
-                let mut runtime = authenticated_runtime(&base_url, &phone, &code, &device)?;
+                let mut runtime = authenticated_runtime(&auth)?;
                 let start = terminal_request(
                     &runtime,
                     "Client.NeoCMS.Page.Publish",
@@ -496,58 +467,40 @@ fn run_client(command: ClientCommand) -> Result<Value> {
             }
         },
         ClientCommand::Outpost { command } => {
-            let (base_url, phone, code, device, action, payload) = match command {
+            let (auth, action, payload) = match command {
                 OutpostCommand::List {
-                    base_url,
-                    phone,
-                    code,
-                    device,
+                    auth,
                     enterprise,
                     site,
                 } => (
-                    base_url,
-                    phone,
-                    code,
-                    device,
+                    auth,
                     "Platform.Outpost.Site.List",
                     json!({"enterprise_id":enterprise,"site_id":site}),
                 ),
                 OutpostCommand::Assign {
-                    base_url,
-                    phone,
-                    code,
-                    device,
+                    auth,
                     enterprise,
                     site,
                     node,
                     operation_id,
                 } => (
-                    base_url,
-                    phone,
-                    code,
-                    device,
+                    auth,
                     "Platform.Outpost.Site.Assign",
                     json!({"operation_id":operation_id,"enterprise_id":enterprise,"site_id":site,"node_id":node}),
                 ),
                 OutpostCommand::Unassign {
-                    base_url,
-                    phone,
-                    code,
-                    device,
+                    auth,
                     enterprise,
                     site,
                     node,
                     operation_id,
                 } => (
-                    base_url,
-                    phone,
-                    code,
-                    device,
+                    auth,
                     "Platform.Outpost.Site.Unassign",
                     json!({"operation_id":operation_id,"enterprise_id":enterprise,"site_id":site,"node_id":node}),
                 ),
             };
-            let mut runtime = authenticated_runtime(&base_url, &phone, &code, &device)?;
+            let mut runtime = authenticated_runtime(&auth)?;
             let result = terminal_request(&runtime, action, None, payload);
             runtime.shutdown();
             result
@@ -610,25 +563,60 @@ fn poll_publication(
     }
 }
 
-fn authenticated_runtime(base_url: &str, phone: &str, code: &str, device: &str) -> Result<Runtime> {
-    let endpoint =
-        AuthEndpoint::new(base_url).map_err(|value| anyhow!("invalid auth endpoint: {value:?}"))?;
+fn authenticated_runtime(auth: &AuthenticationArgs) -> Result<Runtime> {
+    let endpoint = AuthEndpoint::new(&auth.base_url)
+        .map_err(|value| anyhow!("invalid auth endpoint: {value:?}"))?;
     let client = LoginClient::new(endpoint.clone())
         .map_err(|value| anyhow!("cannot create login client: {value:?}"))?;
-    let challenge = client
-        .request_code(phone)
-        .map_err(|value| anyhow!("request code failed: {value:?}"))?;
+    let (challenge, code) = login_material(&client, auth)?;
     let store = Arc::new(MemoryStore::default());
     let credentials = client
-        .login(&challenge, code, device, ClientKind::Web, store.as_ref())
+        .login(
+            &challenge,
+            &code,
+            &auth.device,
+            ClientKind::Web,
+            store.as_ref(),
+        )
         .map_err(|value| anyhow!("login failed: {value:?}"))?;
     let terminal = endpoint
-        .terminal_endpoint(resolve_terminal_address(base_url)?)
+        .terminal_endpoint(resolve_terminal_address(&auth.base_url)?)
         .map_err(|value| anyhow!("invalid terminal endpoint: {value:?}"))?;
     let runtime = Runtime::start(terminal, credentials, store)
         .map_err(|value| anyhow!("cannot start terminal runtime: {value:?}"))?;
     wait_until_ready(&runtime)?;
     Ok(runtime)
+}
+
+fn login_material(client: &LoginClient, auth: &AuthenticationArgs) -> Result<(String, String)> {
+    let challenge = match auth.challenge {
+        Some(value) => value.to_string(),
+        None => client
+            .request_code(
+                auth.phone
+                    .as_deref()
+                    .context("phone is required without challenge")?,
+            )
+            .map_err(|value| anyhow!("request code failed: {value:?}"))?,
+    };
+    let code = if auth.code_stdin {
+        read_code(&mut std::io::stdin())?
+    } else {
+        auth.code.clone().context("code is required")?
+    };
+    Ok((challenge, code))
+}
+
+fn read_code(input: &mut impl Read) -> Result<String> {
+    let mut value = String::new();
+    input
+        .read_to_string(&mut value)
+        .context("cannot read code from stdin")?;
+    let code = value.trim();
+    if code.is_empty() || code.lines().count() != 1 || code.chars().any(char::is_whitespace) {
+        return Err(anyhow!("stdin code must be one non-empty token"));
+    }
+    Ok(code.to_owned())
 }
 
 fn terminal_request(
@@ -754,5 +742,53 @@ mod tests {
         let digest = value["digest"].as_str().unwrap();
         assert_eq!(digest.len(), 64);
         assert!(digest.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn stdin_code_is_trimmed_without_appearing_in_errors() {
+        assert_eq!(read_code(&mut " 123456\n".as_bytes()).unwrap(), "123456");
+        let error = read_code(&mut "123 456\n".as_bytes())
+            .unwrap_err()
+            .to_string();
+        assert!(!error.contains("123 456"));
+    }
+
+    #[test]
+    fn challenge_and_stdin_site_arguments_parse_together() {
+        let parsed = Cli::try_parse_from([
+            "cgeos2",
+            "client",
+            "site",
+            "create",
+            "--base-url",
+            "https://api.example.test",
+            "--challenge",
+            "00000000-0000-0000-0000-000000000001",
+            "--code-stdin",
+            "--enterprise",
+            "00000000-0000-0000-0000-000000000002",
+            "--name",
+            "Official",
+            "--site-type",
+            "site",
+        ]);
+        assert!(parsed.is_ok());
+    }
+
+    #[test]
+    fn conflicting_code_sources_are_rejected() {
+        let conflict = Cli::try_parse_from([
+            "cgeos2",
+            "client",
+            "login",
+            "--base-url",
+            "https://api.example.test",
+            "--phone",
+            "REDACTED_DEBUG_PHONE",
+            "--code",
+            "123456",
+            "--code-stdin",
+        ]);
+        assert!(conflict.is_err());
     }
 }

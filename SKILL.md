@@ -8,8 +8,9 @@ Use this skill when an AI Agent needs to inspect or exercise CGEOS2 service boun
 - Treat a non-zero exit as failure; never infer login success from a challenge response.
 - `client login` performs real HTTP requests to `/auth/challenge` and `/auth/login`; it is not
   a local simulation. Use only an authorized debug endpoint.
-- For Portal `--debug-pass`, pass the fixed phone exactly as `REDACTED_DEBUG_PHONE`; do not add `+`.
-- The CLI-only `debug-pass` feature does not weaken default `client-service` builds.
+- Obtain test identities through an authorized secret-management channel. Never place real
+  accounts, one-time codes, tokens, or internal endpoints in repository content or command history.
+- Supply one-time codes with `--code-stdin`; do not use `--code` in shared examples or automation.
 
 ## Access Service checks
 
@@ -47,7 +48,7 @@ within one process, never prints the token, and exits non-zero for a server-side
 
 ```bash
 cgeos2 --json client call \
-  --base-url https://api.example.test --phone REDACTED_DEBUG_PHONE --code REDACTED_DEBUG_CODE \
+  --base-url https://api.example.test --phone "$AUTHORIZED_PHONE" --code-stdin \
   --action Client.Tenant.Sites.List \
   --enterprise 00000000-0000-0000-0000-000000000001
 ```

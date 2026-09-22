@@ -20,45 +20,48 @@ CLI 通过相邻仓库路径依赖 `../access-service` 与 `../client-service`�
 
 ## 示例
 
+以下联网示例仅使用占位地址和环境变量。请从获授权的密钥管理渠道取得测试账号，
+并通过标准输入传入一次性验证码；不要把真实账号、验证码或内部端点写入命令历史和文档。
+
+```bash
 cgeos2 access version
 cgeos2 access init --encryption --device-consent
 cgeos2 access validate-inquiry --name Agent --contact agent@example.test --message inspect
 cgeos2 access digest --site-id demo --payload '{"message":"inspect"}'
 
-cgeos2 client login --base-url https://api.example.test --phone REDACTED_DEBUG_PHONE --code REDACTED_DEBUG_CODE
-cgeos2 client challenge --base-url https://api.example.test --phone REDACTED_DEBUG_PHONE
+cgeos2 client login --base-url https://api.example.test --phone "$AUTHORIZED_PHONE" --code-stdin
+cgeos2 client challenge --base-url https://api.example.test --phone "$AUTHORIZED_PHONE"
 cgeos2 client build --action Client.Auth.Login.Request --payload '{"username":"tester"}'
-cgeos2 client call --base-url https://api.example.test --phone REDACTED_DEBUG_PHONE --code REDACTED_DEBUG_CODE \
+cgeos2 client call --base-url https://api.example.test --phone "$AUTHORIZED_PHONE" --code-stdin \
   --action Client.Tenant.Sites.List --enterprise 00000000-0000-0000-0000-000000000001
 
 # HyperAdmin：同一登录会话内发起并轮询企业开通任务
 cgeos2 client enterprise provision --base-url https://api.example.test \
-  --phone REDACTED_DEBUG_PHONE --code REDACTED_DEBUG_CODE --name TEST --owner <ACCOUNT_UUID> \
+  --phone "$AUTHORIZED_PHONE" --code-stdin --name TEST --owner <ACCOUNT_UUID> \
   --license-template <TEMPLATE_UUID> --expires-at-seconds 2082758400
 
 # 企业站点：operation-id 可显式传入，超时后用原值重试，不要生成新值
 cgeos2 client site create --base-url https://api.example.test \
-  --phone REDACTED_DEBUG_PHONE --code REDACTED_DEBUG_CODE --enterprise <ENTERPRISE_UUID> \
+  --phone "$AUTHORIZED_PHONE" --code-stdin --enterprise <ENTERPRISE_UUID> \
   --name 'TEST Site' --site-type site --domain site.example.test \
   --template-id fleks-site --template-version 0.1.0 --preset-id cubegarden-official
 
 # Console 已发送 OTP 时复用 challenge；验证码只从 stdin 读取
 printf '%s\n' "$OTP" | cgeos2 client site create --base-url https://api.example.test \
   --challenge <CHALLENGE_UUID> --code-stdin --enterprise <ENTERPRISE_UUID> \
-  --name 'CubeGarden Studio' --site-type site --domain site.example.test \
+  --name 'Example Site' --site-type site --domain site.example.test \
   --template-id fleks-site --template-version 0.1.0 --preset-id cubegarden-official
 
-cgeos2 client outpost list --base-url https://api.example.test --phone REDACTED_DEBUG_PHONE --code REDACTED_DEBUG_CODE
-cgeos2 client outpost assign --base-url https://api.example.test --phone REDACTED_DEBUG_PHONE --code REDACTED_DEBUG_CODE \
+cgeos2 client outpost list --base-url https://api.example.test --phone "$AUTHORIZED_PHONE" --code-stdin
+cgeos2 client outpost assign --base-url https://api.example.test --phone "$AUTHORIZED_PHONE" --code-stdin \
   --enterprise <ENTERPRISE_UUID> --site <SITE_UUID> --node <OUTPOST_UUID> --operation-id <UUID>
-cgeos2 client site publish --base-url https://api.example.test --phone REDACTED_DEBUG_PHONE --code REDACTED_DEBUG_CODE \
+cgeos2 client site publish --base-url https://api.example.test --phone "$AUTHORIZED_PHONE" --code-stdin \
   --enterprise <ENTERPRISE_UUID> --site <SITE_UUID> --page index --expected-revision 1 \
   --operation-id <UUID> --wait-seconds 120
 ```
 
-`client login` 复用 `client-service` 原生登录流程。CLI 显式启用 `debug-pass` feature，以便
-对接 Portal `--debug-pass` 的固定号码 `REDACTED_DEBUG_PHONE`；该例外只存在 CLI 构建，不会改变默认
-client-service 构建的手机号校验。登录成功后凭据仅保存在当前进程内存，token 不打印。
+`client login` 复用 `client-service` 原生登录流程。登录成功后凭据仅保存在当前进程内存，
+token 不打印。账号及验证码由获授权的调试环境提供，仓库不记录内部测试凭据。
 `client challenge` 可先生成预签登录挑战；后续联网命令用 `--challenge` 避免重复发送验证码，
 并可用 `--code-stdin` 读取一行 OTP。`--code` 与 `--code-stdin` 冲突，验证码和 token 均不写入输出。
 `client call` 同样只在当前进程保存凭据，并通过该 API origin 的 `/terminal` WSS

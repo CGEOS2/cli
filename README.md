@@ -58,6 +58,14 @@ cgeos2 client outpost assign --base-url https://api.example.test --phone "$AUTHO
 cgeos2 client site publish --base-url https://api.example.test --phone "$AUTHORIZED_PHONE" --code-stdin \
   --enterprise <ENTERPRISE_UUID> --site <SITE_UUID> --page index --expected-revision 1 \
   --operation-id <UUID> --wait-seconds 120
+
+# Agent 工具提案按站点隔离；确认时 Java 会重新校验 AI_USE 与 CONTENT_WRITE。
+cgeos2 client agent run --base-url https://api.example.test --phone "$AUTHORIZED_PHONE" --code-stdin \
+  --enterprise <ENTERPRISE_UUID> --site <SITE_UUID> --message '更新商品草稿'
+cgeos2 client agent session --base-url https://api.example.test --phone "$AUTHORIZED_PHONE" --code-stdin \
+  --enterprise <ENTERPRISE_UUID> --site <SITE_UUID>
+cgeos2 client agent confirm --base-url https://api.example.test --phone "$AUTHORIZED_PHONE" --code-stdin \
+  --enterprise <ENTERPRISE_UUID> --site <SITE_UUID> --approval <APPROVAL_UUID> --approve
 ```
 
 `client login` 复用 `client-service` 原生登录流程。登录成功后凭据仅保存在当前进程内存，

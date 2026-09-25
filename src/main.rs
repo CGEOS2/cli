@@ -115,6 +115,11 @@ enum ClientCommand {
         #[command(subcommand)]
         command: OutpostCommand,
     },
+    /// Site-scoped Agent chat, approval, recovery and audit operations.
+    Agent {
+        #[command(subcommand)]
+        command: AgentCommand,
+    },
     Validate {
         request: String,
     },
@@ -243,6 +248,39 @@ enum OutpostCommand {
         node: Uuid,
         #[arg(long)]
         operation_id: Uuid,
+    },
+}
+
+#[derive(Subcommand)]
+enum AgentCommand {
+    Run {
+        #[command(flatten)] auth: AuthenticationArgs,
+        #[arg(long)] enterprise: Uuid,
+        #[arg(long)] site: Uuid,
+        #[arg(long)] message: String,
+    },
+    Confirm {
+        #[command(flatten)] auth: AuthenticationArgs,
+        #[arg(long)] enterprise: Uuid,
+        #[arg(long)] site: Uuid,
+        #[arg(long)] approval: Uuid,
+        #[arg(long, conflicts_with = "reject")] approve: bool,
+        #[arg(long, conflicts_with = "approve")] reject: bool,
+    },
+    Session {
+        #[command(flatten)] auth: AuthenticationArgs,
+        #[arg(long)] enterprise: Uuid,
+        #[arg(long)] site: Uuid,
+    },
+    Cancel {
+        #[command(flatten)] auth: AuthenticationArgs,
+        #[arg(long)] enterprise: Uuid,
+        #[arg(long)] site: Uuid,
+    },
+    Audit {
+        #[command(flatten)] auth: AuthenticationArgs,
+        #[arg(long)] enterprise: Uuid,
+        #[arg(long)] site: Uuid,
     },
 }
 
@@ -520,6 +558,30 @@ fn run_client(command: ClientCommand) -> Result<Value> {
             };
             let mut runtime = authenticated_runtime(&auth)?;
             let result = terminal_request(&runtime, action, None, payload);
+            runtime.shutdown();
+            result
+        }
+        ClientCommand::Agent { command } => {
+            let (auth, action, enterprise, payload) = match command {
+                AgentCommand::Run { auth, enterprise, site, message } =>
+                    (auth, "Client.Platform.Agent.Run", enterprise,
+                     json!({"site_id":site,"message":message})),
+                AgentCommand::Confirm { auth, enterprise, site, approval, approve, reject } => {
+                    if approve == reject {
+                        return Err(anyhow!("exactly one of --approve or --reject is required"));
+                    }
+                    (auth, "Client.Platform.Agent.Confirm", enterprise,
+                     json!({"site_id":site,"approval_id":approval,"approved":approve}))
+                }
+                AgentCommand::Session { auth, enterprise, site } =>
+                    (auth, "Client.Platform.Agent.Session", enterprise, json!({"site_id":site})),
+                AgentCommand::Cancel { auth, enterprise, site } =>
+                    (auth, "Client.Platform.Agent.Cancel", enterprise, json!({"site_id":site})),
+                AgentCommand::Audit { auth, enterprise, site } =>
+                    (auth, "Client.Platform.Agent.Audit", enterprise, json!({"site_id":site})),
+            };
+            let mut runtime = authenticated_runtime(&auth)?;
+            let result = terminal_request(&runtime, action, Some(enterprise), payload);
             runtime.shutdown();
             result
         }

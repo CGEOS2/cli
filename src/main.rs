@@ -77,6 +77,21 @@ struct ClientArgs {
 
 #[derive(Subcommand)]
 enum ClientCommand {
+    /// Upload one media image to a site's public media scope (presign → PUT → confirm).
+    MediaUpload {
+        #[command(flatten)]
+        auth: AuthenticationArgs,
+        #[arg(long)]
+        enterprise: Uuid,
+        #[arg(long)]
+        site: Uuid,
+        #[arg(long)]
+        file: String,
+        #[arg(long, default_value = "image/png")]
+        content_type: String,
+        #[arg(long)]
+        filename: Option<String>,
+    },
     /// Request an OTP challenge without consuming it; safe to hand to a later command.
     Challenge {
         #[arg(long)]
@@ -388,6 +403,90 @@ fn run_access(command: AccessCommand) -> Result<Value> {
 
 fn run_client(command: ClientCommand) -> Result<Value> {
     match command {
+        ClientCommand::MediaUpload {
+            auth,
+            enterprise,
+            site,
+            file,
+            content_type,
+            filename,
+        } => {
+            use sha2::{Digest, Sha256};
+            let bytes = std::fs::read(&file)
+                .map_err(|error| anyhow!("cannot read media file: {error}"))?;
+            let name = filename.unwrap_or_else(|| {
+                std::path::Path::new(&file)
+                    .file_name()
+                    .map(|value| value.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "upload.bin".to_string())
+            });
+            let mut runtime = authenticated_runtime(&auth)?;
+            let presigned = terminal_request(
+                &runtime,
+                "Client.NeoCMS.Media.Presign",
+                Some(enterprise),
+                json!({"site_id": site, "filename": name, "content_type": content_type,
+                    "size_bytes": bytes.len()}),
+            )?;
+            let upload = presigned
+                .get("upload")
+                .ok_or_else(|| anyhow!("presign response missing upload"))?
+                .clone();
+            let resource_id = upload
+                .get("resourceId").or_else(|| upload.get("resource_id"))
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow!("presign response missing resource_id"))?;
+            let upload_url = upload
+                .get("uploadUrl").or_else(|| upload.get("upload_url"))
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow!("presign response missing upload_url"))?;
+            let mut command = std::process::Command::new("curl");
+            command.arg("-sS").arg("-f").arg("-X").arg("PUT").arg("--data-binary").arg(format!("@{file}"));
+            if let Some(headers) = upload
+                .get("requiredHeaders")
+                .or_else(|| upload.get("required_headers"))
+                .and_then(Value::as_object)
+            {
+                for (key, value) in headers {
+                    if let Some(value) = value.as_str() {
+                        command.arg("-H").arg(format!("{key}: {value}"));
+                    }
+                }
+            }
+            command.arg(upload_url);
+            let put = command.output()
+                .map_err(|error| anyhow!("cannot run curl: {error}"))?;
+            if std::env::var("CGEOS_MEDIA_DEBUG").is_ok() {
+                eprintln!("PUT status={} stderr={}",
+                    put.status, String::from_utf8_lossy(&put.stderr));
+            }
+            if !put.status.success() {
+                return Err(anyhow!("media upload failed: {}",
+                    String::from_utf8_lossy(&put.stderr)));
+            }
+            let digest = format!("{:x}", {
+                use sha2::{Digest, Sha256};
+                let mut hasher = Sha256::new();
+                hasher.update(&bytes);
+                hasher.finalize()
+            });
+            let confirm_payload = json!({"site_id": site, "resource_id": resource_id,
+                "sha256_digest": digest, "actual_size_bytes": bytes.len()});
+            if std::env::var("CGEOS_MEDIA_DEBUG").is_ok() {
+                eprintln!("CONFIRM payload={confirm_payload}");
+            }
+            let confirmed = terminal_request(
+                &runtime,
+                "Client.NeoCMS.Media.Confirm",
+                Some(enterprise),
+                confirm_payload,
+            );
+            if std::env::var("CGEOS_MEDIA_DEBUG").is_ok() {
+                eprintln!("CONFIRM result={confirmed:?}");
+            }
+            runtime.shutdown();
+            confirmed
+        }
         ClientCommand::Challenge { base_url, phone } => {
             let endpoint = AuthEndpoint::new(&base_url)
                 .map_err(|code| anyhow!("invalid auth endpoint: {code:?}"))?;

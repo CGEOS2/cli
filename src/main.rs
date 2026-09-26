@@ -212,6 +212,34 @@ enum SiteCommand {
         operation_id: Uuid,
         #[arg(long, default_value_t = 120)]
         wait_seconds: u64,
+        /// Durable whole-site template switch: all three must be given together.
+        #[arg(long, requires = "target_template_version")]
+        target_template_id: Option<String>,
+        #[arg(long, requires = "target_template_id")]
+        target_template_version: Option<String>,
+        #[arg(long, requires = "target_template_id")]
+        expected_site_revision: Option<i64>,
+    },
+    /// Save one draft batch (add/update/move/remove blocks) with CAS base revision.
+    DraftSave {
+        #[command(flatten)]
+        auth: AuthenticationArgs,
+        #[arg(long)]
+        enterprise: Uuid,
+        #[arg(long)]
+        site: Uuid,
+        #[arg(long)]
+        page: String,
+        #[arg(long)]
+        base_revision: i64,
+        /// Draft operations as a JSON array, e.g. '[{"type":"add_block",...}]'.
+        #[arg(long, conflicts_with = "operations_file")]
+        operations: Option<String>,
+        /// Read the operations JSON array from this file instead.
+        #[arg(long = "operations-file")]
+        operations_file: Option<String>,
+        #[arg(long, default_value_t = Uuid::new_v4())]
+        operation_id: Uuid,
     },
 }
 
@@ -494,17 +522,39 @@ fn run_client(command: ClientCommand) -> Result<Value> {
                 expected_revision,
                 operation_id,
                 wait_seconds,
+                target_template_id,
+                target_template_version,
+                expected_site_revision,
             } => {
                 if expected_revision < 1 {
                     return Err(anyhow!("expected-revision must be positive"));
                 }
+                let switching = target_template_id.is_some();
+                if switching != target_template_version.is_some()
+                    || switching != expected_site_revision.is_some()
+                {
+                    return Err(anyhow!(
+                        "template switch requires --target-template-id, --target-template-version and --expected-site-revision together"
+                    ));
+                }
+                if let Some(expected) = expected_site_revision {
+                    if expected < 1 {
+                        return Err(anyhow!("expected-site-revision must be positive"));
+                    }
+                }
                 let mut runtime = authenticated_runtime(&auth)?;
+                let mut payload = json!({"operation_id":operation_id,"site_id":site,"page_key":page,
+                    "expected_revision":expected_revision});
+                if let Some(target) = target_template_id {
+                    payload["target_template_id"] = json!(target);
+                    payload["target_template_version"] = json!(target_template_version.clone().unwrap());
+                    payload["expected_site_revision"] = json!(expected_site_revision.unwrap());
+                }
                 let start = terminal_request(
                     &runtime,
                     "Client.NeoCMS.Page.Publish",
                     Some(enterprise),
-                    json!({"operation_id":operation_id,"site_id":site,"page_key":page,
-                        "expected_revision":expected_revision}),
+                    payload,
                 );
                 let result = match start {
                     Ok(value) => poll_publication(
@@ -518,6 +568,41 @@ fn run_client(command: ClientCommand) -> Result<Value> {
                     ),
                     Err(error) => Err(error),
                 };
+                runtime.shutdown();
+                result
+            }
+            SiteCommand::DraftSave {
+                auth,
+                enterprise,
+                site,
+                page,
+                base_revision,
+                operations,
+                operations_file,
+                operation_id,
+            } => {
+                if base_revision < 1 {
+                    return Err(anyhow!("base-revision must be positive"));
+                }
+                let raw = match (operations, operations_file) {
+                    (Some(value), None) => value,
+                    (None, Some(path)) => std::fs::read_to_string(path)
+                        .map_err(|error| anyhow!("cannot read operations file: {error}"))?,
+                    _ => return Err(anyhow!("exactly one of --operations or --operations-file is required")),
+                };
+                let parsed: Value = serde_json::from_str(&raw)
+                    .map_err(|error| anyhow!("operations must be a JSON array: {error}"))?;
+                if !parsed.is_array() {
+                    return Err(anyhow!("operations must be a JSON array"));
+                }
+                let mut runtime = authenticated_runtime(&auth)?;
+                let result = terminal_request(
+                    &runtime,
+                    "Client.NeoCMS.Draft.SaveBatch",
+                    Some(enterprise),
+                    json!({"site_id":site,"page_key":page,"base_revision":base_revision,
+                        "op_id":operation_id,"operations":parsed}),
+                );
                 runtime.shutdown();
                 result
             }

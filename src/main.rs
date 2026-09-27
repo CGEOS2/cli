@@ -8,7 +8,7 @@ use cgeos_sdk_shared::native::{Runtime, Status};
 use cgeos_sdk_shared::protocol::{Action, ClientKind, Credentials, Outcome, Request};
 use clap::{Args, Parser, Subcommand};
 use serde_json::{json, Value};
-use std::io::{IsTerminal, Read};
+use std::io::{IsTerminal, Read, Write};
 use std::net::ToSocketAddrs;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -401,6 +401,80 @@ fn run_access(command: AccessCommand) -> Result<Value> {
     }
 }
 
+const MAX_MEDIA_BYTES: u64 = 20 * 1024 * 1024;
+
+fn read_media_snapshot(path: &std::path::Path) -> Result<Vec<u8>> {
+    let file = std::fs::File::open(path).context("cannot open media file")?;
+    if !file.metadata()?.is_file() {
+        return Err(anyhow!("media source must be a regular file"));
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_MEDIA_BYTES + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_MEDIA_BYTES {
+        return Err(anyhow!("media file exceeds 20 MiB"));
+    }
+    Ok(bytes)
+}
+
+fn put_media_snapshot(bytes: &[u8], upload: &Value, upload_url: &str) -> Result<()> {
+    put_media_snapshot_with_deadline(bytes, upload, upload_url, 120)
+}
+
+fn put_media_snapshot_with_deadline(bytes: &[u8], upload: &Value, upload_url: &str, seconds: u32) -> Result<()> {
+    let deadline = seconds.to_string();
+    let mut command = std::process::Command::new("curl");
+    command
+        .args([
+            "-sS",
+            "-f",
+            "--connect-timeout",
+            "10",
+            "--max-time",
+            &deadline,
+            "--speed-limit",
+            "1",
+            "--speed-time",
+            "30",
+            "-X",
+            "PUT",
+            "--data-binary",
+            "@-",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    if let Some(headers) = upload
+        .get("requiredHeaders")
+        .or_else(|| upload.get("required_headers"))
+        .and_then(Value::as_object)
+    {
+        for (key, value) in headers {
+            if let Some(value) = value.as_str() {
+                command.arg("-H").arg(format!("{key}: {value}"));
+            }
+        }
+    }
+    command.arg(upload_url);
+    let mut child = command.spawn().map_err(|_| anyhow!("cannot run curl"))?;
+    let write_result = child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow!("upload input unavailable"))?
+        .write_all(bytes);
+    if write_result.is_err() {
+        let _ = child.kill();
+    }
+    let status = child
+        .wait()
+        .map_err(|_| anyhow!("cannot await media upload"))?;
+    if write_result.is_err() || !status.success() {
+        return Err(anyhow!(
+            "media upload failed or exceeded its deadline"
+        ));
+    }
+    Ok(())
+}
+
 fn run_client(command: ClientCommand) -> Result<Value> {
     match command {
         ClientCommand::MediaUpload {
@@ -411,9 +485,7 @@ fn run_client(command: ClientCommand) -> Result<Value> {
             content_type,
             filename,
         } => {
-            use sha2::{Digest, Sha256};
-            let bytes = std::fs::read(&file)
-                .map_err(|error| anyhow!("cannot read media file: {error}"))?;
+            let bytes = read_media_snapshot(std::path::Path::new(&file))?;
             let name = filename.unwrap_or_else(|| {
                 std::path::Path::new(&file)
                     .file_name()
@@ -433,37 +505,16 @@ fn run_client(command: ClientCommand) -> Result<Value> {
                 .ok_or_else(|| anyhow!("presign response missing upload"))?
                 .clone();
             let resource_id = upload
-                .get("resourceId").or_else(|| upload.get("resource_id"))
+                .get("resourceId")
+                .or_else(|| upload.get("resource_id"))
                 .and_then(Value::as_str)
                 .ok_or_else(|| anyhow!("presign response missing resource_id"))?;
             let upload_url = upload
-                .get("uploadUrl").or_else(|| upload.get("upload_url"))
+                .get("uploadUrl")
+                .or_else(|| upload.get("upload_url"))
                 .and_then(Value::as_str)
                 .ok_or_else(|| anyhow!("presign response missing upload_url"))?;
-            let mut command = std::process::Command::new("curl");
-            command.arg("-sS").arg("-f").arg("-X").arg("PUT").arg("--data-binary").arg(format!("@{file}"));
-            if let Some(headers) = upload
-                .get("requiredHeaders")
-                .or_else(|| upload.get("required_headers"))
-                .and_then(Value::as_object)
-            {
-                for (key, value) in headers {
-                    if let Some(value) = value.as_str() {
-                        command.arg("-H").arg(format!("{key}: {value}"));
-                    }
-                }
-            }
-            command.arg(upload_url);
-            let put = command.output()
-                .map_err(|error| anyhow!("cannot run curl: {error}"))?;
-            if std::env::var("CGEOS_MEDIA_DEBUG").is_ok() {
-                eprintln!("PUT status={} stderr={}",
-                    put.status, String::from_utf8_lossy(&put.stderr));
-            }
-            if !put.status.success() {
-                return Err(anyhow!("media upload failed: {}",
-                    String::from_utf8_lossy(&put.stderr)));
-            }
+            put_media_snapshot(&bytes, &upload, upload_url)?;
             let digest = format!("{:x}", {
                 use sha2::{Digest, Sha256};
                 let mut hasher = Sha256::new();
@@ -472,18 +523,12 @@ fn run_client(command: ClientCommand) -> Result<Value> {
             });
             let confirm_payload = json!({"site_id": site, "resource_id": resource_id,
                 "sha256_digest": digest, "actual_size_bytes": bytes.len()});
-            if std::env::var("CGEOS_MEDIA_DEBUG").is_ok() {
-                eprintln!("CONFIRM payload={confirm_payload}");
-            }
             let confirmed = terminal_request(
                 &runtime,
                 "Client.NeoCMS.Media.Confirm",
                 Some(enterprise),
                 confirm_payload,
             );
-            if std::env::var("CGEOS_MEDIA_DEBUG").is_ok() {
-                eprintln!("CONFIRM result={confirmed:?}");
-            }
             runtime.shutdown();
             confirmed
         }
@@ -994,6 +1039,65 @@ fn next_request_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn upload_uses_frozen_bytes_after_source_path_is_replaced() {
+        use std::net::TcpListener;
+        let path = std::env::temp_dir().join(format!("cgeos-upload-{}", Uuid::new_v4()));
+        std::fs::write(&path, b"original snapshot").unwrap();
+        let bytes = read_media_snapshot(&path).unwrap();
+        std::fs::write(&path, b"replacement").unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut received = Vec::new();
+            let mut buffer = [0u8; 1024];
+            loop {
+                let read = stream.read(&mut buffer).unwrap();
+                assert!(read > 0);
+                received.extend_from_slice(&buffer[..read]);
+                if received.ends_with(b"original snapshot") {
+                    break;
+                }
+            }
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            received
+        });
+        put_media_snapshot(&bytes, &json!({}), &format!("http://{address}/upload")).unwrap();
+        assert!(server.join().unwrap().ends_with(b"original snapshot"));
+    }
+
+    #[test]
+    fn slow_upload_has_a_deadline_and_redacts_the_signed_url() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (_stream, _) = listener.accept().unwrap();
+            thread::sleep(Duration::from_secs(2));
+        });
+        let started = Instant::now();
+        let failure = put_media_snapshot_with_deadline(b"test", &json!({}),
+            &format!("http://{address}/signed?secret=private"), 1).unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(!failure.to_string().contains("private"));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn media_snapshot_read_is_bounded() {
+        let path = std::env::temp_dir().join(format!("cgeos-upload-{}", Uuid::new_v4()));
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(MAX_MEDIA_BYTES + 1).unwrap();
+        assert!(read_media_snapshot(&path).is_err());
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn digest_wraps_access_service_hash_in_json() {

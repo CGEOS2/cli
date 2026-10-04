@@ -1,3 +1,6 @@
+mod desktop;
+mod upload;
+
 use anyhow::{anyhow, Context, Result};
 use cgeos_access_service::{
     initialization_plan, wasm_compute_canonical_digest, wasm_validate_inquiry_form,
@@ -98,6 +101,11 @@ enum ClientCommand {
         base_url: String,
         #[arg(long)]
         phone: String,
+    },
+    /// Resident JSON Lines bridge for the desktop image workbench (stdout carries the protocol only).
+    Desktop {
+        #[arg(long, required = true)]
+        stdio: bool,
     },
     /// Request a code and complete native login against one API origin.
     Login {
@@ -356,6 +364,12 @@ impl SessionStore for MemoryStore {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    if let Command::Client(ClientArgs {
+        command: ClientCommand::Desktop { .. },
+    }) = &cli.command
+    {
+        return desktop::run_stdio();
+    }
     let value = match cli.command {
         Command::Access(args) => run_access(args.command)?,
         Command::Client(args) => run_client(args.command)?,
@@ -417,62 +431,16 @@ fn read_media_snapshot(path: &std::path::Path) -> Result<Vec<u8>> {
 }
 
 fn put_media_snapshot(bytes: &[u8], upload: &Value, upload_url: &str) -> Result<()> {
-    put_media_snapshot_with_deadline(bytes, upload, upload_url, 120)
+    put_media_snapshot_with_deadline(bytes, upload, upload_url, upload::DEFAULT_TOTAL_SECONDS)
 }
 
-fn put_media_snapshot_with_deadline(bytes: &[u8], upload: &Value, upload_url: &str, seconds: u32) -> Result<()> {
-    let deadline = seconds.to_string();
-    let mut command = std::process::Command::new("curl");
-    command
-        .args([
-            "-sS",
-            "-f",
-            "--connect-timeout",
-            "10",
-            "--max-time",
-            &deadline,
-            "--speed-limit",
-            "1",
-            "--speed-time",
-            "30",
-            "-X",
-            "PUT",
-            "--data-binary",
-            "@-",
-        ])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    if let Some(headers) = upload
-        .get("requiredHeaders")
-        .or_else(|| upload.get("required_headers"))
-        .and_then(Value::as_object)
-    {
-        for (key, value) in headers {
-            if let Some(value) = value.as_str() {
-                command.arg("-H").arg(format!("{key}: {value}"));
-            }
-        }
-    }
-    command.arg(upload_url);
-    let mut child = command.spawn().map_err(|_| anyhow!("cannot run curl"))?;
-    let write_result = child
-        .stdin
-        .take()
-        .ok_or_else(|| anyhow!("upload input unavailable"))?
-        .write_all(bytes);
-    if write_result.is_err() {
-        let _ = child.kill();
-    }
-    let status = child
-        .wait()
-        .map_err(|_| anyhow!("cannot await media upload"))?;
-    if write_result.is_err() || !status.success() {
-        return Err(anyhow!(
-            "media upload failed or exceeded its deadline"
-        ));
-    }
-    Ok(())
+fn put_media_snapshot_with_deadline(
+    bytes: &[u8],
+    upload: &Value,
+    upload_url: &str,
+    seconds: u64,
+) -> Result<()> {
+    upload::put_bytes(bytes, upload, upload_url, seconds)
 }
 
 fn run_client(command: ClientCommand) -> Result<Value> {
@@ -532,6 +500,7 @@ fn run_client(command: ClientCommand) -> Result<Value> {
             runtime.shutdown();
             confirmed
         }
+        ClientCommand::Desktop { stdio: _ } => unreachable!("desktop mode is dispatched in main"),
         ClientCommand::Challenge { base_url, phone } => {
             let endpoint = AuthEndpoint::new(&base_url)
                 .map_err(|code| anyhow!("invalid auth endpoint: {code:?}"))?;

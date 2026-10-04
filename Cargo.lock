@@ -175,6 +175,7 @@ dependencies = [
  "clap",
  "serde_json",
  "sha2",
+ "ureq",
  "url",
  "uuid",
 ]

@@ -88,13 +88,23 @@ CLI 源码使用 MIT；链接的 CGEOS2 服务 crate 与第三方组件继续使
 ## 桌面常驻模式
 
 `cgeos2 client desktop --stdio` 供 Windows 商品图像工作台（`../image-workbench`）通过子进程调用：
-stdin/stdout 为 UTF-8 JSON Lines，stdout 只输出协议；一次 `auth.login` 后复用同一 Terminal 连接，凭据只在进程内存中，
-不经命令行参数或日志传递。请求 `{"id","cmd","args"}`，响应 `{"id","ok":true,"data"}` 或
+stdin/stdout 为 UTF-8 JSON Lines，stdout 只输出协议；一次 `auth.login` 后复用同一 Terminal 连接，凭据不经命令行参数或日志传递，也不返回给调用方。请求 `{"id","cmd","args"}`，响应 `{"id","ok":true,"data"}` 或
 `{"id","ok":false,"error":{"code","message","outcome_unknown","detail"}}`；启动时输出一行 `{"event":"ready","protocol":1}`。
 
-命令：`session.ping`、`session.quit`、`auth.challenge`、`auth.login`、`auth.logout`、`auth.status`、`enterprise.list`、
+命令：`session.ping`、`session.quit`、`auth.challenge`、`auth.login`、`auth.restore`、`auth.logout`、`auth.status`、`enterprise.list`、
 `site.list`、`category.list`、`product.list`、`product.get`、`product.save`、`product.publish`、`product.publish_status`、
 `media.list`、`media.upload`。沿用现有后台 Action 与授权，不新增后台业务协议。
 `outcome_unknown` 为真表示服务端可能已执行，调用方必须用 `product.get`、`product.publish_status` 或 `media.list` 核实，
 不得显示为成功；`product.publish` 仅在状态为 `COMMITTED` 时成功，超时返回 `PUBLISH_PENDING`（附 `task_id`）。
-保存沿用调用方提供的 `operation_id`，结果未知时可用同一值重试。stdin 关闭后已入队请求仍会完成，`session.quit` 会取消进行中的发布轮询并清除凭据。
+保存沿用调用方提供的 `operation_id`，结果未知时可用同一值重试。stdin 关闭后已入队请求仍会完成，`session.quit`、stdin 关闭和进程结束都只断开连接（并取消进行中的发布轮询），不清除保存的会话。
+
+### 会话保存（Windows）
+
+`auth.login` 可带可选 `session_file`：Windows 上用当前用户范围的 DPAPI 加密凭据写入该文件（原子替换），加密内容绑定后台地址与设备标识；
+回复含 `persisted` 与 `persist_error`（写入失败时登录仍有效，但本次未持久化，且会删除旧文件以免恢复旧账号）。不带 `session_file` 的旧调用行为不变。
+非 Windows 没有保护器，会话只在内存中（`persisted:false`）。
+
+`auth.restore {base_url, device, session_file}` 不需要验证码，经真实 Terminal 连接验证后返回 `restored:true`。失败码：
+`NO_SESSION`（无文件）、`SESSION_CORRUPT`（损坏，文件被删除）、`SESSION_MISMATCH`（地址或设备不符，文件保留）、
+`SESSION_EXPIRED`（服务端拒绝凭据，已清除）、`SESSION_OFFLINE`（连不上，凭据保留可重试）、`UPDATE_REQUIRED`、`SESSION_STORAGE`。
+`auth.logout {session_file?}` 断开并删除保存的会话（删除失败返回 `SESSION_CLEAR_FAILED`）。

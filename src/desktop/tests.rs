@@ -1,4 +1,6 @@
 use super::*;
+use cgeos_sdk_shared::host::SessionStore;
+use cgeos_sdk_shared::protocol::Credentials;
 use std::collections::{HashMap, VecDeque};
 use std::io::{BufReader, Cursor};
 
@@ -16,6 +18,14 @@ struct Script {
     replies: HashMap<String, VecDeque<Reply>>,
     puts: Vec<usize>,
     put_failure: Option<DesktopError>,
+    /// Saved-session marker: set by a login that carries a session file, kept by disconnect, cleared by logout.
+    saved: Option<PathBuf>,
+    login_files: Vec<Option<PathBuf>>,
+    restores: Vec<(String, String, PathBuf)>,
+    restore_failure: Option<DesktopError>,
+    disconnects: usize,
+    cleared: Vec<Option<PathBuf>>,
+    logout_failure: Option<DesktopError>,
 }
 
 impl Script {
@@ -32,13 +42,35 @@ impl Gateway for Script {
     fn request_code(&mut self, _: &str, _: &str) -> std::result::Result<String, DesktopError> {
         Ok("00000000-0000-0000-0000-00000000cafe".to_owned())
     }
-    fn login(&mut self, _: &str, _: &str, _: &str, _: &str) -> Reply {
+    fn login(&mut self, _: &str, _: &str, _: &str, _: &str, session_file: Option<&Path>) -> Reply {
         self.authenticated = true;
         self.logins += 1;
+        self.login_files.push(session_file.map(Path::to_path_buf));
+        if let Some(file) = session_file {
+            self.saved = Some(file.to_path_buf());
+        }
         Ok(json!({"account": "acct", "authenticated": true}))
     }
-    fn logout(&mut self) {
+    fn restore(&mut self, base_url: &str, device: &str, session_file: &Path) -> Reply {
+        self.restores.push((base_url.to_owned(), device.to_owned(), session_file.to_path_buf()));
+        if let Some(error) = self.restore_failure.clone() {
+            return Err(error);
+        }
+        self.authenticated = true;
+        Ok(json!({"account": "acct", "authenticated": true, "restored": true}))
+    }
+    fn disconnect(&mut self) {
         self.authenticated = false;
+        self.disconnects += 1;
+    }
+    fn logout(&mut self, session_file: Option<&Path>) -> std::result::Result<(), DesktopError> {
+        self.authenticated = false;
+        if let Some(error) = self.logout_failure.clone() {
+            return Err(error);
+        }
+        self.cleared.push(session_file.map(Path::to_path_buf));
+        self.saved = None;
+        Ok(())
     }
     fn authenticated(&self) -> bool {
         self.authenticated
@@ -328,12 +360,275 @@ fn failed_publication_is_an_error_and_a_timeout_is_unknown_not_success() {
 }
 
 #[test]
-fn quit_logs_out_and_stops_without_reading_later_lines() {
+fn quit_disconnects_but_keeps_the_saved_session_and_stops_reading() {
     let mut script = Script::default();
-    let input = [login_line(), request("q", "session.quit", json!({})), request("late", "session.ping", json!({}))].concat();
+    let login = request("login", "auth.login", json!({"base_url": "https://api.example.test", "phone": "+15555550100",
+        "code": "123456", "session_file": "C:/Users/测试 用户/session.dat"}));
+    let input = [login, request("q", "session.quit", json!({})), request("late", "session.ping", json!({}))].concat();
     let out = run(&mut script, input.into_bytes(), 4096);
     assert_eq!(out.last().unwrap()["id"], "q");
     assert!(!script.authenticated);
+    assert_eq!(script.disconnects, 1);
+    assert!(script.cleared.is_empty(), "closing must not forget the login");
+    assert_eq!(script.saved, Some(PathBuf::from("C:/Users/测试 用户/session.dat")));
+}
+
+#[test]
+fn losing_the_peer_without_quit_also_only_disconnects() {
+    let mut script = Script::default();
+    let login = request("login", "auth.login", json!({"base_url": "https://api.example.test", "phone": "+15555550100",
+        "code": "123456", "session_file": "/tmp/s.dat"}));
+    run(&mut script, login.into_bytes(), 4096); // input ends: stdin closed
+    assert_eq!(script.disconnects, 1);
+    assert!(script.cleared.is_empty());
+    assert!(script.saved.is_some());
+}
+
+#[test]
+fn login_without_a_session_file_keeps_the_old_call_working() {
+    let mut script = Script::default();
+    let out = run(&mut script, login_line().into_bytes(), 4096);
+    assert_eq!(out[1]["ok"], true);
+    assert_eq!(script.login_files, vec![None]);
+    assert!(script.saved.is_none());
+}
+
+#[test]
+fn restore_needs_a_session_file_and_passes_backend_device_and_path() {
+    let mut script = Script::default();
+    let input = [
+        request("bad", "auth.restore", json!({"base_url": "https://api.example.test"})),
+        request("r", "auth.restore", json!({"base_url": "https://api.example.test", "device": "dev-1",
+            "session_file": "C:/数据 目录/session.dat"})),
+        request("e", "enterprise.list", json!({})),
+    ]
+    .concat();
+    let out = run(&mut script, input.into_bytes(), 4096);
+    assert_eq!(out[1]["error"]["code"], "BAD_REQUEST");
+    assert_eq!(out[2]["ok"], true);
+    assert_eq!(out[2]["data"]["restored"], true);
+    assert_eq!(out[3]["ok"], true, "calls work after a restore without any code or login");
+    assert_eq!(script.logins, 0);
+    assert_eq!(
+        script.restores,
+        vec![("https://api.example.test".into(), "dev-1".into(), PathBuf::from("C:/数据 目录/session.dat"))]
+    );
+}
+
+#[test]
+fn restore_failures_keep_their_codes_and_leave_the_bridge_unauthenticated() {
+    for code in ["NO_SESSION", "SESSION_CORRUPT", "SESSION_MISMATCH", "SESSION_EXPIRED", "SESSION_OFFLINE"] {
+        let mut script = Script::default();
+        script.restore_failure = Some(DesktopError::new(code, "x"));
+        let input = [
+            request("r", "auth.restore", json!({"base_url": "https://api.example.test", "session_file": "/tmp/s.dat"})),
+            request("e", "enterprise.list", json!({})),
+        ]
+        .concat();
+        let out = run(&mut script, input.into_bytes(), 4096);
+        assert_eq!(out[1]["error"]["code"], code);
+        assert_eq!(out[1]["error"]["outcome_unknown"], false);
+        assert_eq!(out[2]["error"]["code"], "NOT_AUTHENTICATED");
+    }
+}
+
+#[test]
+fn logout_clears_the_named_session_and_reports_a_failed_removal() {
+    let mut script = Script::default();
+    let input = [
+        login_line(),
+        request("o", "auth.logout", json!({"session_file": "/tmp/s.dat"})),
+        request("e", "enterprise.list", json!({})),
+    ]
+    .concat();
+    let out = run(&mut script, input.into_bytes(), 4096);
+    assert_eq!(out[2]["ok"], true);
+    assert_eq!(out[2]["data"]["authenticated"], false);
+    assert_eq!(out[3]["error"]["code"], "NOT_AUTHENTICATED");
+    assert_eq!(script.cleared, vec![Some(PathBuf::from("/tmp/s.dat"))]);
+
+    let mut failing = Script::default();
+    failing.logout_failure = Some(DesktopError::new("SESSION_CLEAR_FAILED", "locked"));
+    let out = run(&mut failing, request("o", "auth.logout", json!({})).into_bytes(), 4096);
+    assert_eq!(out[1]["error"]["code"], "SESSION_CLEAR_FAILED");
+}
+
+fn scratch() -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("cgeos2-session-test-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+/// Reversible stand-in for DPAPI so the file logic is testable on every platform.
+struct Xor(u8);
+
+impl session_file::Protector for Xor {
+    fn protect(&self, plain: &[u8]) -> std::result::Result<Vec<u8>, SessionFileError> {
+        Ok(plain.iter().map(|byte| byte ^ self.0).collect())
+    }
+    fn unprotect(&self, sealed: &[u8]) -> std::result::Result<Vec<u8>, SessionFileError> {
+        self.protect(sealed)
+    }
+}
+
+struct Broken;
+
+impl session_file::Protector for Broken {
+    fn protect(&self, _: &[u8]) -> std::result::Result<Vec<u8>, SessionFileError> {
+        Err(SessionFileError::Io("cannot seal".into()))
+    }
+    fn unprotect(&self, _: &[u8]) -> std::result::Result<Vec<u8>, SessionFileError> {
+        Err(SessionFileError::Corrupt)
+    }
+}
+
+const BASE: &str = "https://api.example.test";
+const DEVICE: &str = "cgeos2-workbench";
+
+fn credentials(device: &str) -> Credentials {
+    Credentials {
+        account: Uuid::from_u128(1),
+        session: Uuid::from_u128(2),
+        device_id: device.to_owned(),
+        token: "ab".repeat(32),
+        kind: ClientKind::Web,
+    }
+}
+
+fn file_in(dir: &Path) -> SessionFile {
+    SessionFile::new(dir.join("数据 目录").join("session.dat"), Arc::new(Xor(0x5a)))
+}
+
+#[test]
+fn saved_session_round_trips_without_plaintext_and_leaves_no_temp_file() {
+    let dir = scratch();
+    let file = file_in(&dir);
+    file.save(BASE, &credentials(DEVICE)).unwrap();
+    let raw = std::fs::read_to_string(dir.join("数据 目录").join("session.dat")).unwrap();
+    assert!(!raw.contains(&"ab".repeat(32)) && !raw.contains(BASE) && !raw.contains(DEVICE), "{raw}");
+    let loaded = file.load(&format!("{BASE}/"), DEVICE).unwrap();
+    assert!(loaded == credentials(DEVICE));
+    let leftovers: Vec<_> = std::fs::read_dir(dir.join("数据 目录")).unwrap().collect();
+    assert_eq!(leftovers.len(), 1);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn another_backend_or_device_is_a_mismatch_and_the_file_is_kept() {
+    let dir = scratch();
+    let file = file_in(&dir);
+    file.save(BASE, &credentials(DEVICE)).unwrap();
+    assert_eq!(file.load("https://other.example.test", DEVICE).err(), Some(SessionFileError::Mismatch));
+    assert_eq!(file.load(BASE, "another-device").err(), Some(SessionFileError::Mismatch));
+    assert!(file.load(BASE, DEVICE).is_ok(), "a mismatch must not destroy the saved login");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn missing_and_damaged_files_are_told_apart() {
+    let dir = scratch();
+    let file = file_in(&dir);
+    assert_eq!(file.load(BASE, DEVICE).err(), Some(SessionFileError::Missing));
+    file.save(BASE, &credentials(DEVICE)).unwrap();
+    let path = dir.join("数据 目录").join("session.dat");
+    let good = std::fs::read_to_string(&path).unwrap();
+    let other_key = SessionFile::new(&path, Arc::new(Xor(0x11)));
+    for broken in [
+        String::new(),
+        "not json".to_owned(),
+        good[..good.len() / 2].to_owned(),
+        good.replace("\"format\":1", "\"format\":9"),
+        r#"{"format":1,"data":"!!!"}"#.to_owned(),
+    ] {
+        std::fs::write(&path, &broken).unwrap();
+        assert_eq!(file.load(BASE, DEVICE).err(), Some(SessionFileError::Corrupt), "{broken}");
+    }
+    std::fs::write(&path, &good).unwrap();
+    assert_eq!(other_key.load(BASE, DEVICE).err(), Some(SessionFileError::Corrupt), "wrong key reads as damaged");
+    // a payload that decrypts but carries invalid credentials is also damaged
+    let mut bad = credentials(DEVICE);
+    bad.token = "short".into();
+    file.save(BASE, &bad).unwrap();
+    assert_eq!(file.load(BASE, DEVICE).err(), Some(SessionFileError::Corrupt));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn clear_removes_the_file_and_is_idempotent() {
+    let dir = scratch();
+    let file = file_in(&dir);
+    file.save(BASE, &credentials(DEVICE)).unwrap();
+    file.clear().unwrap();
+    file.clear().unwrap();
+    assert_eq!(file.load(BASE, DEVICE).err(), Some(SessionFileError::Missing));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn store_mirrors_login_to_the_file_and_the_sdk_clear_removes_it() {
+    let dir = scratch();
+    let file = file_in(&dir);
+    let store = PersistingStore::with_file(file.clone(), BASE);
+    assert!(store.persists());
+    store.save(&credentials(DEVICE)).unwrap();
+    assert!(store.take_failure().is_none());
+    assert!(file.load(BASE, DEVICE).is_ok());
+    assert!(store.load().unwrap().is_some());
+    store.clear().unwrap(); // what the SDK does when the server rejects the credentials
+    assert!(store.load().unwrap().is_none());
+    assert_eq!(file.load(BASE, DEVICE).err(), Some(SessionFileError::Missing));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn a_failed_write_keeps_the_login_alive_reports_it_and_drops_the_stale_file() {
+    let dir = scratch();
+    let good = file_in(&dir);
+    good.save(BASE, &credentials(DEVICE)).unwrap(); // an older saved login
+    let broken = SessionFile::new(dir.join("数据 目录").join("session.dat"), Arc::new(Broken));
+    let store = PersistingStore::with_file(broken, BASE);
+    store.save(&credentials(DEVICE)).unwrap();
+    assert!(store.take_failure().is_some(), "the caller must be able to tell the login was not persisted");
+    assert!(store.take_failure().is_none());
+    assert!(store.load().unwrap().is_some(), "the running session is unaffected");
+    assert_eq!(good.load(BASE, DEVICE).err(), Some(SessionFileError::Missing), "an older account must not come back");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn memory_only_store_never_touches_the_disk() {
+    let store = PersistingStore::memory_only();
+    assert!(!store.persists());
+    store.save(&credentials(DEVICE)).unwrap();
+    assert!(store.take_failure().is_none());
+    store.clear().unwrap();
+    assert!(store.load().unwrap().is_none());
+}
+
+#[test]
+fn restore_distinguishes_rejected_credentials_from_being_offline() {
+    let code = |status, timed_out| match restore_outcome(status, timed_out) {
+        Some(Ok(())) => "READY".to_owned(),
+        Some(Err(error)) => error.code,
+        None => "WAIT".to_owned(),
+    };
+    assert_eq!(code(Status::Ready, false), "READY");
+    assert_eq!(code(Status::CredentialsCleared, false), "SESSION_EXPIRED");
+    assert_eq!(code(Status::StorageFailure, false), "SESSION_STORAGE");
+    assert_eq!(code(Status::UpdateRequired, false), "UPDATE_REQUIRED");
+    assert_eq!(code(Status::Connecting, false), "WAIT");
+    assert_eq!(code(Status::Offline, false), "WAIT");
+    assert_eq!(code(Status::Offline, true), "SESSION_OFFLINE");
+    assert_eq!(code(Status::Connecting, true), "SESSION_OFFLINE");
+    assert!(!restore_outcome(Status::Offline, true).unwrap().unwrap_err().outcome_unknown);
+}
+
+#[test]
+fn session_errors_map_to_stable_protocol_codes() {
+    assert_eq!(session_error(SessionFileError::Missing).code, "NO_SESSION");
+    assert_eq!(session_error(SessionFileError::Corrupt).code, "SESSION_CORRUPT");
+    assert_eq!(session_error(SessionFileError::Mismatch).code, "SESSION_MISMATCH");
+    assert_eq!(session_error(SessionFileError::Io("x".into())).code, "SESSION_STORAGE");
 }
 
 #[test]

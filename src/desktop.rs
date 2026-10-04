@@ -1,22 +1,27 @@
 //! `cgeos2 client desktop --stdio`: resident UTF-8 JSON Lines bridge for the desktop workbench.
 //!
 //! stdout carries the protocol only; diagnostics never include credentials, tokens or signed URLs.
-//! Credentials stay in this process's memory for the lifetime of one login.
+//! Credentials stay in this process; with a session file (Windows DPAPI) they are also saved for the next start.
+//! Closing the bridge only disconnects: the saved session is removed by `auth.logout` or when the server rejects it.
 //!
 //! Request:  `{"id":"<opaque>","cmd":"product.save","args":{...}}`
 //! Response: `{"id":"<opaque>","ok":true,"data":{...}}` or
 //!           `{"id":"<opaque>","ok":false,"error":{"code":"CONFLICT","message":"...","outcome_unknown":false}}`
 //! A single `{"event":"ready",...}` line is written at start-up.
 
-use super::{read_media_snapshot, resolve_terminal_address, wait_until_ready, MemoryStore};
+mod session_file;
+
+use super::{read_media_snapshot, resolve_terminal_address, wait_until_ready};
 use crate::upload;
+use session_file::{platform_protector, PersistingStore, SessionFile, SessionFileError};
 use anyhow::Result;
 use cgeos_sdk_shared::login::{AuthEndpoint, LoginClient};
-use cgeos_sdk_shared::native::Runtime;
+use cgeos_sdk_shared::native::{Runtime, Status};
 use cgeos_sdk_shared::protocol::{Action, ClientKind, Code, Outcome};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use std::io::{BufRead, Read, Write};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -74,8 +79,14 @@ type Reply = std::result::Result<Value, DesktopError>;
 /// Network side of the bridge; replaced by a scripted double in tests.
 pub trait Gateway {
     fn request_code(&mut self, base_url: &str, phone: &str) -> std::result::Result<String, DesktopError>;
-    fn login(&mut self, base_url: &str, challenge: &str, code: &str, device: &str) -> Reply;
-    fn logout(&mut self);
+    /// `session_file`: where to keep the login for the next start (honoured where a protector exists).
+    fn login(&mut self, base_url: &str, challenge: &str, code: &str, device: &str, session_file: Option<&Path>) -> Reply;
+    /// Reconnect with the saved login; never asks for a code.
+    fn restore(&mut self, base_url: &str, device: &str, session_file: &Path) -> Reply;
+    /// Drop the connection and the in-memory login; the saved session stays.
+    fn disconnect(&mut self);
+    /// Forget the login for good: connection, memory and the saved session file.
+    fn logout(&mut self, session_file: Option<&Path>) -> std::result::Result<(), DesktopError>;
     fn authenticated(&self) -> bool;
     fn call(&mut self, action: &str, enterprise: Option<Uuid>, payload: Value) -> Reply;
     fn put_object(&mut self, bytes: &[u8], upload: &Value, url: &str) -> std::result::Result<(), DesktopError>;
@@ -177,7 +188,7 @@ where
             break;
         }
     }
-    desktop.gateway.logout();
+    desktop.gateway.disconnect(); // closing only disconnects; the saved session survives a normal exit
     drop(receiver);
     // The reader thread may be blocked on stdin; process exit reaps it.
     if handle.is_finished() {
@@ -261,10 +272,18 @@ impl<'a> Desktop<'a> {
                     Some(value) => value,
                     None => self.gateway.request_code(&base_url, &string(args, "phone")?)?,
                 };
-                self.gateway.login(&base_url, &challenge, &code, &device)
+                let file = optional_string(args, "session_file")?.map(PathBuf::from);
+                self.gateway.login(&base_url, &challenge, &code, &device, file.as_deref())
+            }
+            "auth.restore" => {
+                let base_url = string(args, "base_url")?;
+                let device = optional_string(args, "device")?.unwrap_or_else(|| "cgeos2-workbench".to_owned());
+                let file = PathBuf::from(string(args, "session_file")?);
+                self.gateway.restore(&base_url, &device, &file)
             }
             "auth.logout" => {
-                self.gateway.logout();
+                let file = optional_string(args, "session_file")?.map(PathBuf::from);
+                self.gateway.logout(file.as_deref())?;
                 Ok(json!({"authenticated": false}))
             }
             "auth.status" => Ok(json!({"authenticated": self.gateway.authenticated()})),
@@ -545,10 +564,54 @@ fn uuid(args: &Map<String, Value>, key: &str) -> std::result::Result<Uuid, Deskt
     Uuid::parse_str(&string(args, key)?).map_err(|_| DesktopError::bad(format!("{key} must be a UUID")))
 }
 
-/// Production gateway: one login, one Terminal connection, credentials only in memory.
+/// Production gateway: one login, one Terminal connection; credentials stay in this process
+/// (and, on Windows, in the DPAPI-sealed session file the peer names).
 #[derive(Default)]
 struct LiveGateway {
     runtime: Option<Runtime>,
+    /// Saved-session file of the current login, so `auth.logout` can remove it without being told again.
+    session: Option<PathBuf>,
+}
+
+/// How long a restore waits for the Terminal to become ready before reporting it as offline.
+const RESTORE_WAIT: Duration = Duration::from_secs(10);
+
+/// Maps the Terminal status seen while restoring to a final answer; `None` means keep waiting.
+///
+/// Only a server rejection clears the saved session (the SDK does that itself); being offline never does.
+fn restore_outcome(status: Status, timed_out: bool) -> Option<std::result::Result<(), DesktopError>> {
+    match status {
+        Status::Ready => Some(Ok(())),
+        Status::CredentialsCleared => Some(Err(DesktopError::new(
+            "SESSION_EXPIRED",
+            "the saved login was rejected by the server and has been removed",
+        ))),
+        Status::UpdateRequired => Some(Err(DesktopError::new(
+            "UPDATE_REQUIRED",
+            "the terminal requires a client update; the saved login is kept",
+        ))),
+        Status::StorageFailure => Some(Err(DesktopError::new(
+            "SESSION_STORAGE",
+            "the saved login could not be updated on this machine",
+        ))),
+        Status::Connecting | Status::Offline if timed_out => Some(Err(DesktopError::new(
+            "SESSION_OFFLINE",
+            "cannot reach the server; the saved login is kept, try again later",
+        ))),
+        Status::Connecting | Status::Offline => None,
+    }
+}
+
+fn session_error(error: SessionFileError) -> DesktopError {
+    match error {
+        SessionFileError::Missing => DesktopError::new("NO_SESSION", "no saved login"),
+        SessionFileError::Corrupt => DesktopError::new("SESSION_CORRUPT", "the saved login is damaged and was removed"),
+        SessionFileError::Mismatch => DesktopError::new(
+            "SESSION_MISMATCH",
+            "the saved login belongs to another backend address or device",
+        ),
+        SessionFileError::Io(message) => DesktopError::new("SESSION_STORAGE", message),
+    }
 }
 
 fn code_name(code: Code) -> String {
@@ -566,13 +629,16 @@ impl Gateway for LiveGateway {
             .map_err(|code| DesktopError::new("LOGIN_FAILED", format!("request code failed: {}", code_name_login(&code))))
     }
 
-    fn login(&mut self, base_url: &str, challenge: &str, code: &str, device: &str) -> Reply {
-        self.logout();
+    fn login(&mut self, base_url: &str, challenge: &str, code: &str, device: &str, session_file: Option<&Path>) -> Reply {
+        self.disconnect();
         let endpoint = AuthEndpoint::new(base_url)
             .map_err(|_| DesktopError::new("LOGIN_FAILED", "invalid auth endpoint"))?;
         let client = LoginClient::new(endpoint.clone())
             .map_err(|_| DesktopError::new("LOGIN_FAILED", "cannot create login client"))?;
-        let store = Arc::new(MemoryStore::default());
+        let store = Arc::new(match (session_file, platform_protector()) {
+            (Some(path), Some(protector)) => PersistingStore::with_file(SessionFile::new(path, protector), base_url),
+            _ => PersistingStore::memory_only(),
+        });
         let credentials = client
             .login(challenge, code, device, ClientKind::Web, store.as_ref())
             .map_err(|code| DesktopError::new("LOGIN_FAILED", format!("login failed: {}", code_name_login(&code))))?;
@@ -581,18 +647,84 @@ impl Gateway for LiveGateway {
         let terminal = endpoint
             .terminal_endpoint(addresses)
             .map_err(|_| DesktopError::new("LOGIN_FAILED", "invalid terminal endpoint"))?;
+        let persist_error = store.take_failure();
         let info = json!({"account": credentials.account, "session": credentials.session,
-            "device_id": credentials.device_id, "authenticated": true});
+            "device_id": credentials.device_id, "authenticated": true,
+            "persisted": store.persists() && persist_error.is_none(), "persist_error": persist_error});
         let runtime = Runtime::start(terminal, credentials, store)
             .map_err(|_| DesktopError::new("UNAVAILABLE", "cannot start terminal runtime"))?;
         wait_until_ready(&runtime).map_err(|error| DesktopError::new("UNAVAILABLE", error.to_string()))?;
         self.runtime = Some(runtime);
+        self.session = session_file.map(Path::to_path_buf);
         Ok(info)
     }
 
-    fn logout(&mut self) {
+    fn restore(&mut self, base_url: &str, device: &str, session_file: &Path) -> Reply {
+        self.disconnect();
+        let protector = platform_protector().ok_or_else(|| session_error(SessionFileError::Missing))?;
+        let file = SessionFile::new(session_file, protector);
+        let credentials = match file.load(base_url, device) {
+            Ok(credentials) => credentials,
+            Err(SessionFileError::Corrupt) => {
+                let _ = file.clear(); // unusable: back to the login state
+                return Err(session_error(SessionFileError::Corrupt));
+            }
+            Err(error) => return Err(session_error(error)),
+        };
+        let endpoint = AuthEndpoint::new(base_url)
+            .map_err(|_| DesktopError::new("LOGIN_FAILED", "invalid auth endpoint"))?;
+        let addresses = resolve_terminal_address(base_url)
+            .map_err(|_| DesktopError::new("SESSION_OFFLINE", "cannot resolve the API host; the saved login is kept"))?;
+        let terminal = endpoint
+            .terminal_endpoint(addresses)
+            .map_err(|_| DesktopError::new("LOGIN_FAILED", "invalid terminal endpoint"))?;
+        let store = Arc::new(PersistingStore::with_file(file, base_url));
+        store.seed(credentials.clone());
+        let info = json!({"account": credentials.account, "session": credentials.session,
+            "device_id": credentials.device_id, "authenticated": true, "restored": true});
+        let mut runtime = Runtime::start(terminal, credentials, store)
+            .map_err(|_| DesktopError::new("UNAVAILABLE", "cannot start terminal runtime"))?;
+        let deadline = Instant::now() + RESTORE_WAIT;
+        loop {
+            let status = runtime.handle().status();
+            if let Some(outcome) = restore_outcome(status, Instant::now() >= deadline) {
+                return match outcome {
+                    Ok(()) => {
+                        self.runtime = Some(runtime);
+                        self.session = Some(session_file.to_path_buf());
+                        Ok(info)
+                    }
+                    Err(error) => {
+                        runtime.shutdown();
+                        Err(error)
+                    }
+                };
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn disconnect(&mut self) {
         if let Some(mut runtime) = self.runtime.take() {
             runtime.shutdown();
+        }
+    }
+
+    fn logout(&mut self, session_file: Option<&Path>) -> std::result::Result<(), DesktopError> {
+        self.disconnect();
+        let remembered = self.session.take();
+        let mut failure = None;
+        for path in session_file.map(Path::to_path_buf).into_iter().chain(remembered) {
+            if let Err(error) = SessionFile::clear_path(&path) {
+                failure = Some(error);
+            }
+        }
+        match failure {
+            None => Ok(()),
+            Some(error) => Err(DesktopError::new(
+                "SESSION_CLEAR_FAILED",
+                format!("the saved login could not be removed: {error}"),
+            )),
         }
     }
 

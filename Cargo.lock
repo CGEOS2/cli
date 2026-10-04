@@ -173,11 +173,13 @@ dependencies = [
  "cgeos-access-service",
  "cgeos-sdk-shared",
  "clap",
+ "serde",
  "serde_json",
  "sha2",
  "ureq",
  "url",
  "uuid",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

@@ -11,7 +11,9 @@ use cgeos_sdk_shared::native::{Runtime, Status};
 use cgeos_sdk_shared::protocol::{Action, ClientKind, Credentials, Outcome, Request};
 use clap::{Args, Parser, Subcommand};
 use serde_json::{json, Value};
-use std::io::{IsTerminal, Read, Write};
+use std::io::{IsTerminal, Read};
+#[cfg(test)]
+use std::io::Write;
 use std::net::ToSocketAddrs;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -80,14 +82,14 @@ struct ClientArgs {
 
 #[derive(Subcommand)]
 enum ClientCommand {
-    /// Upload one media image to a site's public media scope (presign → PUT → confirm).
+    /// Upload one media image to the enterprise public media scope (presign → PUT → confirm).
     MediaUpload {
         #[command(flatten)]
         auth: AuthenticationArgs,
         #[arg(long)]
         enterprise: Uuid,
         #[arg(long)]
-        site: Uuid,
+        site: Option<Uuid>,
         #[arg(long)]
         file: String,
         #[arg(long, default_value = "image/png")]
@@ -138,7 +140,7 @@ enum ClientCommand {
         #[command(subcommand)]
         command: OutpostCommand,
     },
-    /// Site-scoped Agent chat, approval, recovery and audit operations.
+    /// Enterprise product or site page Agent chat, approval, recovery and audit operations.
     Agent {
         #[command(subcommand)]
         command: AgentCommand,
@@ -305,33 +307,52 @@ enum OutpostCommand {
 #[derive(Subcommand)]
 enum AgentCommand {
     Run {
-        #[command(flatten)] auth: AuthenticationArgs,
-        #[arg(long)] enterprise: Uuid,
-        #[arg(long)] site: Uuid,
-        #[arg(long)] message: String,
+        #[command(flatten)]
+        auth: AuthenticationArgs,
+        #[arg(long)]
+        enterprise: Uuid,
+        #[arg(long)]
+        site: Option<Uuid>,
+        #[arg(long)]
+        message: String,
     },
     Confirm {
-        #[command(flatten)] auth: AuthenticationArgs,
-        #[arg(long)] enterprise: Uuid,
-        #[arg(long)] site: Uuid,
-        #[arg(long)] approval: Uuid,
-        #[arg(long, conflicts_with = "reject")] approve: bool,
-        #[arg(long, conflicts_with = "approve")] reject: bool,
+        #[command(flatten)]
+        auth: AuthenticationArgs,
+        #[arg(long)]
+        enterprise: Uuid,
+        #[arg(long)]
+        site: Option<Uuid>,
+        #[arg(long)]
+        approval: Uuid,
+        #[arg(long, conflicts_with = "reject")]
+        approve: bool,
+        #[arg(long, conflicts_with = "approve")]
+        reject: bool,
     },
     Session {
-        #[command(flatten)] auth: AuthenticationArgs,
-        #[arg(long)] enterprise: Uuid,
-        #[arg(long)] site: Uuid,
+        #[command(flatten)]
+        auth: AuthenticationArgs,
+        #[arg(long)]
+        enterprise: Uuid,
+        #[arg(long)]
+        site: Option<Uuid>,
     },
     Cancel {
-        #[command(flatten)] auth: AuthenticationArgs,
-        #[arg(long)] enterprise: Uuid,
-        #[arg(long)] site: Uuid,
+        #[command(flatten)]
+        auth: AuthenticationArgs,
+        #[arg(long)]
+        enterprise: Uuid,
+        #[arg(long)]
+        site: Option<Uuid>,
     },
     Audit {
-        #[command(flatten)] auth: AuthenticationArgs,
-        #[arg(long)] enterprise: Uuid,
-        #[arg(long)] site: Uuid,
+        #[command(flatten)]
+        auth: AuthenticationArgs,
+        #[arg(long)]
+        enterprise: Uuid,
+        #[arg(long)]
+        site: Option<Uuid>,
     },
 }
 
@@ -448,7 +469,7 @@ fn run_client(command: ClientCommand) -> Result<Value> {
         ClientCommand::MediaUpload {
             auth,
             enterprise,
-            site,
+            site: _,
             file,
             content_type,
             filename,
@@ -465,7 +486,7 @@ fn run_client(command: ClientCommand) -> Result<Value> {
                 &runtime,
                 "Client.NeoCMS.Media.Presign",
                 Some(enterprise),
-                json!({"site_id": site, "filename": name, "content_type": content_type,
+                json!({"version": 2, "filename": name, "content_type": content_type,
                     "size_bytes": bytes.len()}),
             )?;
             let upload = presigned
@@ -489,7 +510,7 @@ fn run_client(command: ClientCommand) -> Result<Value> {
                 hasher.update(&bytes);
                 hasher.finalize()
             });
-            let confirm_payload = json!({"site_id": site, "resource_id": resource_id,
+            let confirm_payload = json!({"version": 2, "resource_id": resource_id,
                 "sha256_digest": digest, "actual_size_bytes": bytes.len()});
             let confirmed = terminal_request(
                 &runtime,
@@ -660,7 +681,8 @@ fn run_client(command: ClientCommand) -> Result<Value> {
                     "expected_revision":expected_revision});
                 if let Some(target) = target_template_id {
                     payload["target_template_id"] = json!(target);
-                    payload["target_template_version"] = json!(target_template_version.clone().unwrap());
+                    payload["target_template_version"] =
+                        json!(target_template_version.clone().unwrap());
                     payload["expected_site_revision"] = json!(expected_site_revision.unwrap());
                 }
                 let start = terminal_request(
@@ -701,7 +723,11 @@ fn run_client(command: ClientCommand) -> Result<Value> {
                     (Some(value), None) => value,
                     (None, Some(path)) => std::fs::read_to_string(path)
                         .map_err(|error| anyhow!("cannot read operations file: {error}"))?,
-                    _ => return Err(anyhow!("exactly one of --operations or --operations-file is required")),
+                    _ => {
+                        return Err(anyhow!(
+                            "exactly one of --operations or --operations-file is required"
+                        ))
+                    }
                 };
                 let parsed: Value = serde_json::from_str(&raw)
                     .map_err(|error| anyhow!("operations must be a JSON array: {error}"))?;
@@ -760,24 +786,70 @@ fn run_client(command: ClientCommand) -> Result<Value> {
             result
         }
         ClientCommand::Agent { command } => {
-            let (auth, action, enterprise, payload) = match command {
-                AgentCommand::Run { auth, enterprise, site, message } =>
-                    (auth, "Client.Platform.Agent.Run", enterprise,
-                     json!({"site_id":site,"message":message})),
-                AgentCommand::Confirm { auth, enterprise, site, approval, approve, reject } => {
+            let (auth, action, enterprise, mut payload) = match command {
+                AgentCommand::Run {
+                    auth,
+                    enterprise,
+                    site,
+                    message,
+                } => (
+                    auth,
+                    "Client.Platform.Agent.Run",
+                    enterprise,
+                    json!({"site_id":site,"message":message}),
+                ),
+                AgentCommand::Confirm {
+                    auth,
+                    enterprise,
+                    site,
+                    approval,
+                    approve,
+                    reject,
+                } => {
                     if approve == reject {
                         return Err(anyhow!("exactly one of --approve or --reject is required"));
                     }
-                    (auth, "Client.Platform.Agent.Confirm", enterprise,
-                     json!({"site_id":site,"approval_id":approval,"approved":approve}))
+                    (
+                        auth,
+                        "Client.Platform.Agent.Confirm",
+                        enterprise,
+                        json!({"site_id":site,"approval_id":approval,"approved":approve}),
+                    )
                 }
-                AgentCommand::Session { auth, enterprise, site } =>
-                    (auth, "Client.Platform.Agent.Session", enterprise, json!({"site_id":site})),
-                AgentCommand::Cancel { auth, enterprise, site } =>
-                    (auth, "Client.Platform.Agent.Cancel", enterprise, json!({"site_id":site})),
-                AgentCommand::Audit { auth, enterprise, site } =>
-                    (auth, "Client.Platform.Agent.Audit", enterprise, json!({"site_id":site})),
+                AgentCommand::Session {
+                    auth,
+                    enterprise,
+                    site,
+                } => (
+                    auth,
+                    "Client.Platform.Agent.Session",
+                    enterprise,
+                    json!({"site_id":site}),
+                ),
+                AgentCommand::Cancel {
+                    auth,
+                    enterprise,
+                    site,
+                } => (
+                    auth,
+                    "Client.Platform.Agent.Cancel",
+                    enterprise,
+                    json!({"site_id":site}),
+                ),
+                AgentCommand::Audit {
+                    auth,
+                    enterprise,
+                    site,
+                } => (
+                    auth,
+                    "Client.Platform.Agent.Audit",
+                    enterprise,
+                    json!({"site_id":site}),
+                ),
             };
+            if payload.get("site_id").is_some_and(Value::is_null) {
+                payload.as_object_mut().unwrap().remove("site_id");
+            }
             let mut runtime = authenticated_runtime(&auth)?;
             let result = terminal_request(&runtime, action, Some(enterprise), payload);
             runtime.shutdown();
@@ -1052,8 +1124,13 @@ mod tests {
             thread::sleep(Duration::from_secs(2));
         });
         let started = Instant::now();
-        let failure = put_media_snapshot_with_deadline(b"test", &json!({}),
-            &format!("http://{address}/signed?secret=private"), 1).unwrap_err();
+        let failure = put_media_snapshot_with_deadline(
+            b"test",
+            &json!({}),
+            &format!("http://{address}/signed?secret=private"),
+            1,
+        )
+        .unwrap_err();
         assert!(started.elapsed() < Duration::from_secs(2));
         assert!(!failure.to_string().contains("private"));
         server.join().unwrap();

@@ -108,3 +108,7 @@ stdin/stdout 为 UTF-8 JSON Lines，stdout 只输出协议；一次 `auth.login`
 `NO_SESSION`（无文件）、`SESSION_CORRUPT`（损坏，文件被删除）、`SESSION_MISMATCH`（地址或设备不符，文件保留）、
 `SESSION_EXPIRED`（服务端拒绝凭据，已清除）、`SESSION_OFFLINE`（连不上，凭据保留可重试）、`UPDATE_REQUIRED`、`SESSION_STORAGE`。
 `auth.logout {session_file?}` 断开并删除保存的会话（删除失败返回 `SESSION_CLEAR_FAILED`）。
+
+## 企业共享商品（2026-10-10）
+
+商品、分类、商品媒体与导入使用企业范围 `version: 2`，新请求不携带 `site_id`，当前模型不再包含 `visible_in`。商品发布同步企业全部上线站点，回执为父任务及分站点进度；无上线站点仍可保存草稿，发布返回无目标。页面、模板和语言继续使用站点上下文。旧请求先按原操作号确认，再全站同步。详见工作区 [共享商品契约](../build/docs/reference/enterprise-products.md) 与 [验证记录](../build/docs/validation/enterprise-products-2026-10-10.md)。

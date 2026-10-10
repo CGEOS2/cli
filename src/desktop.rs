@@ -13,12 +13,12 @@ mod session_file;
 
 use super::{read_media_snapshot, resolve_terminal_address, wait_until_ready};
 use crate::upload;
-use session_file::{platform_protector, PersistingStore, SessionFile, SessionFileError};
 use anyhow::Result;
 use cgeos_sdk_shared::login::{AuthEndpoint, LoginClient};
 use cgeos_sdk_shared::native::{Runtime, Status};
 use cgeos_sdk_shared::protocol::{Action, ClientKind, Code, Outcome};
 use serde_json::{json, Map, Value};
+use session_file::{platform_protector, PersistingStore, SessionFile, SessionFileError};
 use sha2::{Digest, Sha256};
 use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
@@ -78,9 +78,20 @@ type Reply = std::result::Result<Value, DesktopError>;
 
 /// Network side of the bridge; replaced by a scripted double in tests.
 pub trait Gateway {
-    fn request_code(&mut self, base_url: &str, phone: &str) -> std::result::Result<String, DesktopError>;
+    fn request_code(
+        &mut self,
+        base_url: &str,
+        phone: &str,
+    ) -> std::result::Result<String, DesktopError>;
     /// `session_file`: where to keep the login for the next start (honoured where a protector exists).
-    fn login(&mut self, base_url: &str, challenge: &str, code: &str, device: &str, session_file: Option<&Path>) -> Reply;
+    fn login(
+        &mut self,
+        base_url: &str,
+        challenge: &str,
+        code: &str,
+        device: &str,
+        session_file: Option<&Path>,
+    ) -> Reply;
     /// Reconnect with the saved login; never asks for a code.
     fn restore(&mut self, base_url: &str, device: &str, session_file: &Path) -> Reply;
     /// Drop the connection and the in-memory login; the saved session stays.
@@ -89,7 +100,12 @@ pub trait Gateway {
     fn logout(&mut self, session_file: Option<&Path>) -> std::result::Result<(), DesktopError>;
     fn authenticated(&self) -> bool;
     fn call(&mut self, action: &str, enterprise: Option<Uuid>, payload: Value) -> Reply;
-    fn put_object(&mut self, bytes: &[u8], upload: &Value, url: &str) -> std::result::Result<(), DesktopError>;
+    fn put_object(
+        &mut self,
+        bytes: &[u8],
+        upload: &Value,
+        url: &str,
+    ) -> std::result::Result<(), DesktopError>;
 }
 
 /// Runs the resident loop on real stdin/stdout until EOF or `session.quit`.
@@ -155,7 +171,12 @@ fn read_items(mut reader: impl BufRead, sender: mpsc::Sender<Item>, closing: Arc
 fn is_quit(line: &[u8]) -> bool {
     serde_json::from_slice::<Value>(line)
         .ok()
-        .and_then(|value| value.get("cmd").and_then(Value::as_str).map(|cmd| cmd == "session.quit"))
+        .and_then(|value| {
+            value
+                .get("cmd")
+                .and_then(Value::as_str)
+                .map(|cmd| cmd == "session.quit")
+        })
         .unwrap_or(false)
 }
 
@@ -177,7 +198,11 @@ where
     let (sender, receiver) = mpsc::channel();
     let reader_closing = closing.clone();
     let handle = std::thread::spawn(move || read_items(reader, sender, reader_closing));
-    let mut desktop = Desktop { gateway, closing, quit: false };
+    let mut desktop = Desktop {
+        gateway,
+        closing,
+        quit: false,
+    };
     while let Ok(item) = receiver.recv() {
         let response = match item {
             Item::Oversize => failure(Value::Null, DesktopError::bad("request line is too long")),
@@ -253,7 +278,9 @@ impl<'a> Desktop<'a> {
 
     fn dispatch(&mut self, command: &str, args: &Map<String, Value>) -> Reply {
         match command {
-            "session.ping" => Ok(json!({"protocol": PROTOCOL_VERSION, "authenticated": self.gateway.authenticated()})),
+            "session.ping" => Ok(
+                json!({"protocol": PROTOCOL_VERSION, "authenticated": self.gateway.authenticated()}),
+            ),
             "session.quit" => {
                 self.quit = true;
                 Ok(json!({"closing": true}))
@@ -267,17 +294,22 @@ impl<'a> Desktop<'a> {
             "auth.login" => {
                 let base_url = string(args, "base_url")?;
                 let code = string(args, "code")?;
-                let device = optional_string(args, "device")?.unwrap_or_else(|| "cgeos2-workbench".to_owned());
+                let device = optional_string(args, "device")?
+                    .unwrap_or_else(|| "cgeos2-workbench".to_owned());
                 let challenge = match optional_string(args, "challenge")? {
                     Some(value) => value,
-                    None => self.gateway.request_code(&base_url, &string(args, "phone")?)?,
+                    None => self
+                        .gateway
+                        .request_code(&base_url, &string(args, "phone")?)?,
                 };
                 let file = optional_string(args, "session_file")?.map(PathBuf::from);
-                self.gateway.login(&base_url, &challenge, &code, &device, file.as_deref())
+                self.gateway
+                    .login(&base_url, &challenge, &code, &device, file.as_deref())
             }
             "auth.restore" => {
                 let base_url = string(args, "base_url")?;
-                let device = optional_string(args, "device")?.unwrap_or_else(|| "cgeos2-workbench".to_owned());
+                let device = optional_string(args, "device")?
+                    .unwrap_or_else(|| "cgeos2-workbench".to_owned());
                 let file = PathBuf::from(string(args, "session_file")?);
                 self.gateway.restore(&base_url, &device, &file)
             }
@@ -303,59 +335,108 @@ impl<'a> Desktop<'a> {
                 if let Some(query) = optional_string(args, "query")? {
                     payload.insert("query".into(), json!(query));
                 }
-                payload.insert("offset".into(), json!(args.get("offset").and_then(Value::as_u64).unwrap_or(0)));
-                payload.insert("limit".into(), json!(args.get("limit").and_then(Value::as_u64).unwrap_or(50).clamp(1, 100)));
-                self.gateway.call("Platform.Enterprise.Index.List", None, Value::Object(payload))
+                payload.insert(
+                    "offset".into(),
+                    json!(args.get("offset").and_then(Value::as_u64).unwrap_or(0)),
+                );
+                payload.insert(
+                    "limit".into(),
+                    json!(args
+                        .get("limit")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(50)
+                        .clamp(1, 100)),
+                );
+                self.gateway.call(
+                    "Platform.Enterprise.Index.List",
+                    None,
+                    Value::Object(payload),
+                )
             }
             "site.list" => {
                 let enterprise = uuid(args, "enterprise")?;
-                self.gateway.call("Client.Tenant.Sites.List", Some(enterprise), json!({}))
+                self.gateway
+                    .call("Client.Tenant.Sites.List", Some(enterprise), json!({}))
             }
             "category.list" => {
-                let (enterprise, site) = (uuid(args, "enterprise")?, uuid(args, "site")?);
-                self.gateway.call("Client.NeoCMS.Category.Query", Some(enterprise), json!({"site_id": site}))
+                let enterprise = uuid(args, "enterprise")?;
+                self.gateway.call(
+                    "Client.NeoCMS.Category.Query",
+                    Some(enterprise),
+                    json!({"version": 2}),
+                )
             }
             "product.list" => {
-                let (enterprise, site) = (uuid(args, "enterprise")?, uuid(args, "site")?);
-                self.gateway.call("Client.NeoCMS.Product.Query", Some(enterprise), json!({"site_id": site}))
+                let enterprise = uuid(args, "enterprise")?;
+                self.gateway.call(
+                    "Client.NeoCMS.Product.Query",
+                    Some(enterprise),
+                    json!({"version": 2}),
+                )
             }
             "product.get" => {
-                let (enterprise, site, product) =
-                    (uuid(args, "enterprise")?, uuid(args, "site")?, uuid(args, "product")?);
+                let (enterprise, product) = (uuid(args, "enterprise")?, uuid(args, "product")?);
                 self.gateway.call(
                     "Client.NeoCMS.Product.Get",
                     Some(enterprise),
-                    json!({"site_id": site, "product_id": product}),
+                    json!({"version": 2, "product_id": product}),
                 )
             }
             "product.save" => self.product_save(args),
             "product.publish" => self.product_publish(args),
+            "product.synchronize" => {
+                let mut sync = args.clone();
+                sync.insert("mode".into(), json!("synchronize"));
+                self.product_publish(&sync)
+            }
             "product.publish_status" => {
-                let (enterprise, site, product, task) = (
-                    uuid(args, "enterprise")?,
-                    uuid(args, "site")?,
-                    uuid(args, "product")?,
-                    uuid(args, "task")?,
-                );
-                self.gateway.call(
+                let enterprise = uuid(args, "enterprise")?;
+                let task = uuid(args, "task")?;
+                let product = if args.contains_key("product") {
+                    Some(uuid(args, "product")?)
+                } else {
+                    None
+                };
+                let mut payload = json!({"task_id":task});
+                if let Some(product) = product {
+                    payload["product_id"] = json!(product);
+                }
+                let value = self.gateway.call(
                     "Client.NeoCMS.Product.PublishStatus",
                     Some(enterprise),
-                    json!({"site_id": site, "product_id": product, "task_id": task}),
-                )
+                    product_payload(args, payload)?,
+                )?;
+                if args.get("version") != Some(&json!(1)) {
+                    cgeos_sdk_tenant::shop::parse_enterprise_product_publication_json(
+                        &value.to_string(),
+                        enterprise,
+                        product,
+                        task,
+                        None,
+                    )
+                    .map_err(|e| DesktopError::unknown("BAD_RESPONSE", e.to_string(), None))?;
+                }
+                Ok(value)
             }
             "media.list" => {
-                let (enterprise, site) = (uuid(args, "enterprise")?, uuid(args, "site")?);
-                self.gateway.call("Client.NeoCMS.Media.Query", Some(enterprise), json!({"site_id": site}))
+                let enterprise = uuid(args, "enterprise")?;
+                self.gateway.call(
+                    "Client.NeoCMS.Media.Query",
+                    Some(enterprise),
+                    json!({"version": 2}),
+                )
             }
             "media.upload" => self.media_upload(args),
-            other => Err(DesktopError::new("UNKNOWN_COMMAND", format!("unknown command {other}"))),
+            other => Err(DesktopError::new(
+                "UNKNOWN_COMMAND",
+                format!("unknown command {other}"),
+            )),
         }
     }
 
     fn product_save(&mut self, args: &Map<String, Value>) -> Reply {
-        let (enterprise, site, product, operation) = (
+        let (enterprise, product, operation) = (
             uuid(args, "enterprise")?,
-            uuid(args, "site")?,
             uuid(args, "product")?,
             uuid(args, "operation_id")?,
         );
@@ -370,10 +451,20 @@ impl<'a> Desktop<'a> {
         let reply = self.gateway.call(
             "Client.NeoCMS.Product.Save",
             Some(enterprise),
-            json!({"site_id": site, "product_id": product, "operation_id": operation,
+            product_payload(
+                args,
+                json!({"product_id": product, "operation_id": operation,
                 "base_revision": base, "body": body}),
+            )?,
         )?;
-        if reply.get("version") != Some(&json!(1)) || reply.get("status") != Some(&json!("SAVED")) {
+        if reply.get("version")
+            != Some(&json!(if args.get("version") == Some(&json!(1)) {
+                1
+            } else {
+                2
+            }))
+            || reply.get("status") != Some(&json!("SAVED"))
+        {
             return Err(DesktopError::unknown(
                 "BAD_RESPONSE",
                 "save response was not a confirmed SAVED result; verify with product.get",
@@ -384,17 +475,21 @@ impl<'a> Desktop<'a> {
     }
 
     fn product_publish(&mut self, args: &Map<String, Value>) -> Reply {
-        let (enterprise, site, product, operation) = (
-            uuid(args, "enterprise")?,
-            uuid(args, "site")?,
-            uuid(args, "product")?,
-            uuid(args, "operation_id")?,
-        );
-        let revision = args
-            .get("expected_revision")
-            .and_then(Value::as_u64)
-            .filter(|value| *value >= 1)
-            .ok_or_else(|| DesktopError::bad("expected_revision must be a positive integer"))?;
+        let enterprise = uuid(args, "enterprise")?;
+        let operation = uuid(args, "operation_id")?;
+        let product = if args.get("mode").and_then(Value::as_str) == Some("synchronize") {
+            None
+        } else {
+            Some(uuid(args, "product")?)
+        };
+        let revision = if product.is_none() {
+            0
+        } else {
+            args.get("expected_revision")
+                .and_then(Value::as_u64)
+                .filter(|value| *value >= 1)
+                .ok_or_else(|| DesktopError::bad("expected_revision must be a positive integer"))?
+        };
         let wait = args
             .get("wait_seconds")
             .and_then(Value::as_u64)
@@ -403,17 +498,66 @@ impl<'a> Desktop<'a> {
         let mut value = self.gateway.call(
             "Client.NeoCMS.Product.Publish",
             Some(enterprise),
-            json!({"site_id": site, "product_id": product, "expected_revision": revision,
-                "operation_id": operation}),
+            product_payload(
+                args,
+                if let Some(product) = product {
+                    json!({"product_id": product, "expected_revision": revision,
+                "operation_id": operation})
+                } else {
+                    json!({"mode":"synchronize","operation_id":operation})
+                },
+            )?,
         )?;
+        match value.get("status").and_then(Value::as_str) {
+            Some("NO_TARGETS") => {
+                return Err(DesktopError::new(
+                    "NO_TARGETS",
+                    "暂无已上线站点，草稿已保留",
+                ))
+            }
+            Some("WAITING") => {
+                return Err(DesktopError {
+                    code: "PUBLICATION_PENDING".into(),
+                    message: "等待企业未完成发布任务".into(),
+                    outcome_unknown: false,
+                    detail: Some(value),
+                })
+            }
+            _ => {}
+        }
+        if args.get("version") != Some(&json!(1)) {
+            cgeos_sdk_tenant::shop::parse_enterprise_product_publication_json(
+                &value.to_string(),
+                enterprise,
+                product,
+                operation,
+                Some(revision),
+            )
+            .map_err(|e| DesktopError::unknown("BAD_RESPONSE", e.to_string(), None))?;
+        }
         let task = value
             .get("task_id")
             .and_then(Value::as_str)
             .and_then(|text| Uuid::parse_str(text).ok())
-            .ok_or_else(|| DesktopError::unknown("BAD_RESPONSE", "publish receipt has no task_id", None))?;
-        let detail = json!({"task_id": task, "operation_id": operation});
+            .ok_or_else(|| {
+                DesktopError::unknown("BAD_RESPONSE", "publish receipt has no task_id", None)
+            })?;
+        let mut detail = json!({"task_id": task, "operation_id": operation});
         let deadline = Instant::now() + Duration::from_secs(wait);
         loop {
+            if args.get("version") != Some(&json!(1)) {
+                cgeos_sdk_tenant::shop::parse_enterprise_product_publication_json(
+                    &value.to_string(),
+                    enterprise,
+                    product,
+                    task,
+                    Some(revision),
+                )
+                .map_err(|e| {
+                    DesktopError::unknown("BAD_RESPONSE", e.to_string(), Some(detail.clone()))
+                })?;
+            }
+            detail["publication"] = value.clone();
             match value.get("status").and_then(Value::as_str) {
                 Some("COMMITTED") => return Ok(value),
                 Some("FAILED") => {
@@ -426,7 +570,11 @@ impl<'a> Desktop<'a> {
                 }
                 Some("DELIVERING" | "ACTIVATING" | "PENDING_ACK") => {
                     if self.closing.load(Ordering::SeqCst) {
-                        return Err(DesktopError::unknown("CANCELLED", "bridge is closing", Some(detail)));
+                        return Err(DesktopError::unknown(
+                            "CANCELLED",
+                            "bridge is closing",
+                            Some(detail),
+                        ));
                     }
                     if Instant::now() >= deadline {
                         return Err(DesktopError::unknown(
@@ -439,7 +587,14 @@ impl<'a> Desktop<'a> {
                     value = self.gateway.call(
                         "Client.NeoCMS.Product.PublishStatus",
                         Some(enterprise),
-                        json!({"site_id": site, "product_id": product, "task_id": task}),
+                        product_payload(
+                            args,
+                            if let Some(product) = product {
+                                json!({"product_id": product, "task_id": task})
+                            } else {
+                                json!({"task_id":task})
+                            },
+                        )?,
                     )?;
                 }
                 _ => {
@@ -454,12 +609,16 @@ impl<'a> Desktop<'a> {
     }
 
     fn media_upload(&mut self, args: &Map<String, Value>) -> Reply {
-        let (enterprise, site) = (uuid(args, "enterprise")?, uuid(args, "site")?);
+        let enterprise = uuid(args, "enterprise")?;
         let path = std::path::PathBuf::from(string(args, "file")?);
         let bytes = read_media_snapshot(&path)
             .map_err(|error| DesktopError::new("FILE_UNREADABLE", error.to_string()))?;
-        let content_type = sniff_image(&bytes)
-            .ok_or_else(|| DesktopError::new("UNSUPPORTED_IMAGE", "only JPEG, PNG and WebP images can be uploaded"))?;
+        let content_type = sniff_image(&bytes).ok_or_else(|| {
+            DesktopError::new(
+                "UNSUPPORTED_IMAGE",
+                "only JPEG, PNG and WebP images can be uploaded",
+            )
+        })?;
         if let Some(declared) = optional_string(args, "content_type")? {
             if declared != content_type {
                 return Err(DesktopError::new(
@@ -476,7 +635,7 @@ impl<'a> Desktop<'a> {
         let presigned = self.gateway.call(
             "Client.NeoCMS.Media.Presign",
             Some(enterprise),
-            json!({"site_id": site, "filename": filename, "content_type": content_type,
+            json!({"version": 2, "filename": filename, "content_type": content_type,
                 "size_bytes": bytes.len()}),
         )?;
         let upload_info = presigned
@@ -484,10 +643,12 @@ impl<'a> Desktop<'a> {
             .filter(|value| value.is_object())
             .ok_or_else(|| DesktopError::new("BAD_RESPONSE", "presign response has no upload"))?
             .clone();
-        let resource = pick(&upload_info, "resourceId", "resource_id")
-            .ok_or_else(|| DesktopError::new("BAD_RESPONSE", "presign response has no resource id"))?;
-        let upload_url = pick(&upload_info, "uploadUrl", "upload_url")
-            .ok_or_else(|| DesktopError::new("BAD_RESPONSE", "presign response has no upload url"))?;
+        let resource = pick(&upload_info, "resourceId", "resource_id").ok_or_else(|| {
+            DesktopError::new("BAD_RESPONSE", "presign response has no resource id")
+        })?;
+        let upload_url = pick(&upload_info, "uploadUrl", "upload_url").ok_or_else(|| {
+            DesktopError::new("BAD_RESPONSE", "presign response has no upload url")
+        })?;
         self.gateway.put_object(&bytes, &upload_info, &upload_url)?;
         let digest = format!("{:x}", Sha256::digest(&bytes));
         let detail = json!({"resource_id": resource, "sha256": digest});
@@ -496,7 +657,7 @@ impl<'a> Desktop<'a> {
             .call(
                 "Client.NeoCMS.Media.Confirm",
                 Some(enterprise),
-                json!({"site_id": site, "resource_id": resource, "sha256_digest": digest,
+                json!({"version": 2, "resource_id": resource, "sha256_digest": digest,
                     "actual_size_bytes": bytes.len()}),
             )
             .map_err(|mut error| {
@@ -517,6 +678,18 @@ impl<'a> Desktop<'a> {
         }
         Ok(json!({"media": media, "size_bytes": bytes.len(), "content_type": content_type}))
     }
+}
+
+fn product_payload(
+    args: &Map<String, Value>,
+    mut payload: Value,
+) -> std::result::Result<Value, DesktopError> {
+    if args.get("version") == Some(&json!(1)) {
+        payload["site_id"] = json!(uuid(args, "site")?);
+    } else {
+        payload["version"] = json!(2);
+    }
+    Ok(payload)
 }
 
 fn poll_interval() -> Duration {
@@ -552,16 +725,22 @@ fn string(args: &Map<String, Value>, key: &str) -> std::result::Result<String, D
     optional_string(args, key)?.ok_or_else(|| DesktopError::bad(format!("{key} is required")))
 }
 
-fn optional_string(args: &Map<String, Value>, key: &str) -> std::result::Result<Option<String>, DesktopError> {
+fn optional_string(
+    args: &Map<String, Value>,
+    key: &str,
+) -> std::result::Result<Option<String>, DesktopError> {
     match args.get(key) {
         None | Some(Value::Null) => Ok(None),
         Some(Value::String(text)) if !text.is_empty() => Ok(Some(text.clone())),
-        Some(_) => Err(DesktopError::bad(format!("{key} must be a non-empty string"))),
+        Some(_) => Err(DesktopError::bad(format!(
+            "{key} must be a non-empty string"
+        ))),
     }
 }
 
 fn uuid(args: &Map<String, Value>, key: &str) -> std::result::Result<Uuid, DesktopError> {
-    Uuid::parse_str(&string(args, key)?).map_err(|_| DesktopError::bad(format!("{key} must be a UUID")))
+    Uuid::parse_str(&string(args, key)?)
+        .map_err(|_| DesktopError::bad(format!("{key} must be a UUID")))
 }
 
 /// Production gateway: one login, one Terminal connection; credentials stay in this process
@@ -579,7 +758,10 @@ const RESTORE_WAIT: Duration = Duration::from_secs(10);
 /// Maps the Terminal status seen while restoring to a final answer; `None` means keep waiting.
 ///
 /// Only a server rejection clears the saved session (the SDK does that itself); being offline never does.
-fn restore_outcome(status: Status, timed_out: bool) -> Option<std::result::Result<(), DesktopError>> {
+fn restore_outcome(
+    status: Status,
+    timed_out: bool,
+) -> Option<std::result::Result<(), DesktopError>> {
     match status {
         Status::Ready => Some(Ok(())),
         Status::CredentialsCleared => Some(Err(DesktopError::new(
@@ -605,7 +787,10 @@ fn restore_outcome(status: Status, timed_out: bool) -> Option<std::result::Resul
 fn session_error(error: SessionFileError) -> DesktopError {
     match error {
         SessionFileError::Missing => DesktopError::new("NO_SESSION", "no saved login"),
-        SessionFileError::Corrupt => DesktopError::new("SESSION_CORRUPT", "the saved login is damaged and was removed"),
+        SessionFileError::Corrupt => DesktopError::new(
+            "SESSION_CORRUPT",
+            "the saved login is damaged and was removed",
+        ),
         SessionFileError::Mismatch => DesktopError::new(
             "SESSION_MISMATCH",
             "the saved login belongs to another backend address or device",
@@ -622,26 +807,47 @@ fn code_name(code: Code) -> String {
 }
 
 impl Gateway for LiveGateway {
-    fn request_code(&mut self, base_url: &str, phone: &str) -> std::result::Result<String, DesktopError> {
+    fn request_code(
+        &mut self,
+        base_url: &str,
+        phone: &str,
+    ) -> std::result::Result<String, DesktopError> {
         let client = login_client(base_url)?;
-        client
-            .request_code(phone)
-            .map_err(|code| DesktopError::new("LOGIN_FAILED", format!("request code failed: {}", code_name_login(&code))))
+        client.request_code(phone).map_err(|code| {
+            DesktopError::new(
+                "LOGIN_FAILED",
+                format!("request code failed: {}", code_name_login(&code)),
+            )
+        })
     }
 
-    fn login(&mut self, base_url: &str, challenge: &str, code: &str, device: &str, session_file: Option<&Path>) -> Reply {
+    fn login(
+        &mut self,
+        base_url: &str,
+        challenge: &str,
+        code: &str,
+        device: &str,
+        session_file: Option<&Path>,
+    ) -> Reply {
         self.disconnect();
         let endpoint = AuthEndpoint::new(base_url)
             .map_err(|_| DesktopError::new("LOGIN_FAILED", "invalid auth endpoint"))?;
         let client = LoginClient::new(endpoint.clone())
             .map_err(|_| DesktopError::new("LOGIN_FAILED", "cannot create login client"))?;
         let store = Arc::new(match (session_file, platform_protector()) {
-            (Some(path), Some(protector)) => PersistingStore::with_file(SessionFile::new(path, protector), base_url),
+            (Some(path), Some(protector)) => {
+                PersistingStore::with_file(SessionFile::new(path, protector), base_url)
+            }
             _ => PersistingStore::memory_only(),
         });
         let credentials = client
             .login(challenge, code, device, ClientKind::Web, store.as_ref())
-            .map_err(|code| DesktopError::new("LOGIN_FAILED", format!("login failed: {}", code_name_login(&code))))?;
+            .map_err(|code| {
+                DesktopError::new(
+                    "LOGIN_FAILED",
+                    format!("login failed: {}", code_name_login(&code)),
+                )
+            })?;
         let addresses = resolve_terminal_address(base_url)
             .map_err(|_| DesktopError::new("UNAVAILABLE", "cannot resolve API host"))?;
         let terminal = endpoint
@@ -653,7 +859,8 @@ impl Gateway for LiveGateway {
             "persisted": store.persists() && persist_error.is_none(), "persist_error": persist_error});
         let runtime = Runtime::start(terminal, credentials, store)
             .map_err(|_| DesktopError::new("UNAVAILABLE", "cannot start terminal runtime"))?;
-        wait_until_ready(&runtime).map_err(|error| DesktopError::new("UNAVAILABLE", error.to_string()))?;
+        wait_until_ready(&runtime)
+            .map_err(|error| DesktopError::new("UNAVAILABLE", error.to_string()))?;
         self.runtime = Some(runtime);
         self.session = session_file.map(Path::to_path_buf);
         Ok(info)
@@ -661,7 +868,8 @@ impl Gateway for LiveGateway {
 
     fn restore(&mut self, base_url: &str, device: &str, session_file: &Path) -> Reply {
         self.disconnect();
-        let protector = platform_protector().ok_or_else(|| session_error(SessionFileError::Missing))?;
+        let protector =
+            platform_protector().ok_or_else(|| session_error(SessionFileError::Missing))?;
         let file = SessionFile::new(session_file, protector);
         let credentials = match file.load(base_url, device) {
             Ok(credentials) => credentials,
@@ -673,8 +881,12 @@ impl Gateway for LiveGateway {
         };
         let endpoint = AuthEndpoint::new(base_url)
             .map_err(|_| DesktopError::new("LOGIN_FAILED", "invalid auth endpoint"))?;
-        let addresses = resolve_terminal_address(base_url)
-            .map_err(|_| DesktopError::new("SESSION_OFFLINE", "cannot resolve the API host; the saved login is kept"))?;
+        let addresses = resolve_terminal_address(base_url).map_err(|_| {
+            DesktopError::new(
+                "SESSION_OFFLINE",
+                "cannot resolve the API host; the saved login is kept",
+            )
+        })?;
         let terminal = endpoint
             .terminal_endpoint(addresses)
             .map_err(|_| DesktopError::new("LOGIN_FAILED", "invalid terminal endpoint"))?;
@@ -714,7 +926,11 @@ impl Gateway for LiveGateway {
         self.disconnect();
         let remembered = self.session.take();
         let mut failure = None;
-        for path in session_file.map(Path::to_path_buf).into_iter().chain(remembered) {
+        for path in session_file
+            .map(Path::to_path_buf)
+            .into_iter()
+            .chain(remembered)
+        {
             if let Err(error) = SessionFile::clear_path(&path) {
                 failure = Some(error);
             }
@@ -747,14 +963,22 @@ impl Gateway for LiveGateway {
             Outcome::Ok { data } => Ok(data),
             Outcome::Error { code } => {
                 let unknown = matches!(code, Code::OutcomeUnknown | Code::Unavailable);
-                let mut error = DesktopError::new(&code_name(code), format!("request failed: {}", code_name(code)));
+                let mut error = DesktopError::new(
+                    &code_name(code),
+                    format!("request failed: {}", code_name(code)),
+                );
                 error.outcome_unknown = unknown;
                 Err(error)
             }
         }
     }
 
-    fn put_object(&mut self, bytes: &[u8], upload: &Value, url: &str) -> std::result::Result<(), DesktopError> {
+    fn put_object(
+        &mut self,
+        bytes: &[u8],
+        upload: &Value,
+        url: &str,
+    ) -> std::result::Result<(), DesktopError> {
         upload::put_bytes(bytes, upload, url, upload::DEFAULT_TOTAL_SECONDS)
             .map_err(|error| DesktopError::new("UPLOAD_FAILED", error.to_string()))
     }
@@ -767,7 +991,8 @@ fn code_name_login(code: &impl std::fmt::Debug) -> String {
 fn login_client(base_url: &str) -> std::result::Result<LoginClient, DesktopError> {
     let endpoint = AuthEndpoint::new(base_url)
         .map_err(|_| DesktopError::new("LOGIN_FAILED", "invalid auth endpoint"))?;
-    LoginClient::new(endpoint).map_err(|_| DesktopError::new("LOGIN_FAILED", "cannot create login client"))
+    LoginClient::new(endpoint)
+        .map_err(|_| DesktopError::new("LOGIN_FAILED", "cannot create login client"))
 }
 
 #[cfg(test)]

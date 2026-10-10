@@ -30,7 +30,10 @@ struct Script {
 
 impl Script {
     fn reply(&mut self, action: &str, reply: Reply) -> &mut Self {
-        self.replies.entry(action.to_owned()).or_default().push_back(reply);
+        self.replies
+            .entry(action.to_owned())
+            .or_default()
+            .push_back(reply);
         self
     }
     fn count(&self, action: &str) -> usize {
@@ -52,7 +55,11 @@ impl Gateway for Script {
         Ok(json!({"account": "acct", "authenticated": true}))
     }
     fn restore(&mut self, base_url: &str, device: &str, session_file: &Path) -> Reply {
-        self.restores.push((base_url.to_owned(), device.to_owned(), session_file.to_path_buf()));
+        self.restores.push((
+            base_url.to_owned(),
+            device.to_owned(),
+            session_file.to_path_buf(),
+        ));
         if let Some(error) = self.restore_failure.clone() {
             return Err(error);
         }
@@ -82,7 +89,12 @@ impl Gateway for Script {
             .and_then(VecDeque::pop_front)
             .unwrap_or_else(|| Ok(json!({"version": 1, "items": []})))
     }
-    fn put_object(&mut self, bytes: &[u8], _: &Value, _: &str) -> std::result::Result<(), DesktopError> {
+    fn put_object(
+        &mut self,
+        bytes: &[u8],
+        _: &Value,
+        _: &str,
+    ) -> std::result::Result<(), DesktopError> {
         self.puts.push(bytes.len());
         match self.put_failure.clone() {
             Some(error) => Err(error),
@@ -109,9 +121,21 @@ fn request(id: &str, cmd: &str, args: Value) -> String {
 }
 
 fn run(script: &mut Script, input: Vec<u8>, step: usize) -> Vec<Value> {
-    let reader = BufReader::with_capacity(7, Trickle { inner: Cursor::new(input), step });
+    let reader = BufReader::with_capacity(
+        7,
+        Trickle {
+            inner: Cursor::new(input),
+            step,
+        },
+    );
     let mut output = Vec::new();
-    serve(reader, &mut output, script, Arc::new(AtomicBool::new(false))).unwrap();
+    serve(
+        reader,
+        &mut output,
+        script,
+        Arc::new(AtomicBool::new(false)),
+    )
+    .unwrap();
     String::from_utf8(output)
         .unwrap()
         .lines()
@@ -120,7 +144,11 @@ fn run(script: &mut Script, input: Vec<u8>, step: usize) -> Vec<Value> {
 }
 
 fn login_line() -> String {
-    request("login", "auth.login", json!({"base_url": "https://api.example.test", "phone": "+15555550100", "code": "123456"}))
+    request(
+        "login",
+        "auth.login",
+        json!({"base_url": "https://api.example.test", "phone": "+15555550100", "code": "123456"}),
+    )
 }
 
 fn png() -> Vec<u8> {
@@ -134,9 +162,11 @@ fn upload_args(file: &std::path::Path) -> Value {
 }
 
 fn presign_reply() -> Reply {
-    Ok(json!({"version": 1, "upload": {"resourceId": "00000000-0000-0000-0000-0000000000f1",
+    Ok(
+        json!({"version": 1, "upload": {"resourceId": "00000000-0000-0000-0000-0000000000f1",
         "uploadUrl": "https://objects.example.test/put?sig=secret", "httpMethod": "PUT",
-        "requiredHeaders": {"content-type": "image/png"}}}))
+        "requiredHeaders": {"content-type": "image/png"}}}),
+    )
 }
 
 #[test]
@@ -146,8 +176,16 @@ fn announces_ready_and_one_login_serves_many_calls_on_one_connection() {
         login_line(),
         request("1", "enterprise.list", json!({})),
         request("2", "site.list", json!({"enterprise": ENTERPRISE})),
-        request("3", "product.list", json!({"enterprise": ENTERPRISE, "site": SITE})),
-        request("4", "category.list", json!({"enterprise": ENTERPRISE, "site": SITE})),
+        request(
+            "3",
+            "product.list",
+            json!({"enterprise": ENTERPRISE, "site": SITE}),
+        ),
+        request(
+            "4",
+            "category.list",
+            json!({"enterprise": ENTERPRISE, "site": SITE}),
+        ),
     ]
     .concat();
     let out = run(&mut script, input.into_bytes(), 4096);
@@ -162,7 +200,11 @@ fn announces_ready_and_one_login_serves_many_calls_on_one_connection() {
 #[test]
 fn json_lines_are_reassembled_from_tiny_reads_with_chinese_text() {
     let mut script = Script::default();
-    let input = [login_line(), request("中文-1", "site.list", json!({"enterprise": ENTERPRISE}))].concat();
+    let input = [
+        login_line(),
+        request("中文-1", "site.list", json!({"enterprise": ENTERPRISE})),
+    ]
+    .concat();
     let out = run(&mut script, input.into_bytes(), 3);
     assert_eq!(out[2]["id"], "中文-1");
     assert_eq!(out[2]["ok"], true);
@@ -174,7 +216,8 @@ fn commands_before_login_are_refused_and_bad_lines_do_not_stop_the_loop() {
     let mut input = b"not json\n\n".to_vec();
     input.extend_from_slice(&[0xff, 0xfe, b'\n']);
     input.extend_from_slice(b"{\"cmd\":\"site.list\"}\n");
-    input.extend_from_slice(request("a", "site.list", json!({"enterprise": ENTERPRISE})).as_bytes());
+    input
+        .extend_from_slice(request("a", "site.list", json!({"enterprise": ENTERPRISE})).as_bytes());
     input.extend_from_slice(request("b", "nope", json!({})).as_bytes());
     input.extend_from_slice(request("c", "session.ping", json!({})).as_bytes());
     let out = run(&mut script, input, 5);
@@ -204,13 +247,27 @@ fn oversized_line_is_rejected_and_the_next_request_still_works() {
 fn permission_denial_and_revision_conflict_are_reported_with_stable_codes() {
     let mut script = Script::default();
     script
-        .reply("Client.NeoCMS.Product.Query", Err(DesktopError::new("FORBIDDEN", "denied")))
-        .reply("Client.NeoCMS.Product.Save", Err(DesktopError::new("CONFLICT", "revision")));
+        .reply(
+            "Client.NeoCMS.Product.Query",
+            Err(DesktopError::new("FORBIDDEN", "denied")),
+        )
+        .reply(
+            "Client.NeoCMS.Product.Save",
+            Err(DesktopError::new("CONFLICT", "revision")),
+        );
     let input = [
         login_line(),
-        request("list", "product.list", json!({"enterprise": ENTERPRISE, "site": SITE})),
-        request("save", "product.save", json!({"enterprise": ENTERPRISE, "site": SITE, "product": PRODUCT,
-            "operation_id": OPERATION, "base_revision": 3, "body": {"title": "T"}})),
+        request(
+            "list",
+            "product.list",
+            json!({"enterprise": ENTERPRISE, "site": SITE}),
+        ),
+        request(
+            "save",
+            "product.save",
+            json!({"enterprise": ENTERPRISE, "site": SITE, "product": PRODUCT,
+            "operation_id": OPERATION, "base_revision": 3, "body": {"title": "T"}}),
+        ),
     ]
     .concat();
     let out = run(&mut script, input.into_bytes(), 4096);
@@ -226,11 +283,18 @@ fn permission_denial_and_revision_conflict_are_reported_with_stable_codes() {
 #[test]
 fn save_requires_a_confirmed_saved_result() {
     let mut script = Script::default();
-    script.reply("Client.NeoCMS.Product.Save", Ok(json!({"version": 1, "status": "PENDING"})));
+    script.reply(
+        "Client.NeoCMS.Product.Save",
+        Ok(json!({"version": 1, "status": "PENDING"})),
+    );
     let input = [
         login_line(),
-        request("save", "product.save", json!({"enterprise": ENTERPRISE, "site": SITE, "product": PRODUCT,
-            "operation_id": OPERATION, "base_revision": 0, "body": {}})),
+        request(
+            "save",
+            "product.save",
+            json!({"enterprise": ENTERPRISE, "site": SITE, "product": PRODUCT,
+            "operation_id": OPERATION, "base_revision": 0, "body": {}}),
+        ),
     ]
     .concat();
     let out = run(&mut script, input.into_bytes(), 4096);
@@ -253,7 +317,11 @@ fn upload_handles_chinese_and_spaced_paths_and_confirms_the_same_bytes() {
             Ok(json!({"version": 1, "media": {"id": "00000000-0000-0000-0000-0000000000f1",
                 "publicUrl": "https://cdn.example.test/a.png", "contentType": "image/png", "sha256": digest}})),
         );
-    let input = [login_line(), request("up", "media.upload", upload_args(&file))].concat();
+    let input = [
+        login_line(),
+        request("up", "media.upload", upload_args(&file)),
+    ]
+    .concat();
     let out = run(&mut script, input.into_bytes(), 9);
     std::fs::remove_dir_all(&directory).unwrap();
     assert_eq!(out[2]["ok"], true, "{}", out[2]);
@@ -274,19 +342,32 @@ fn failed_put_never_confirms_and_unknown_confirm_is_flagged() {
 
     let mut failing = Script::default();
     failing.reply("Client.NeoCMS.Media.Presign", presign_reply());
-    failing.put_failure = Some(DesktopError::new("UPLOAD_FAILED", "media upload rejected with HTTP status 403"));
-    let input = [login_line(), request("up", "media.upload", upload_args(&file))].concat();
+    failing.put_failure = Some(DesktopError::new(
+        "UPLOAD_FAILED",
+        "media upload rejected with HTTP status 403",
+    ));
+    let input = [
+        login_line(),
+        request("up", "media.upload", upload_args(&file)),
+    ]
+    .concat();
     let out = run(&mut failing, input.clone().into_bytes(), 4096);
     assert_eq!(out[2]["error"]["code"], "UPLOAD_FAILED");
     assert_eq!(failing.count("Client.NeoCMS.Media.Confirm"), 0);
 
     let mut unknown = Script::default();
     unknown.reply("Client.NeoCMS.Media.Presign", presign_reply());
-    unknown.reply("Client.NeoCMS.Media.Confirm", Err(DesktopError::new("UNAVAILABLE", "lost")));
+    unknown.reply(
+        "Client.NeoCMS.Media.Confirm",
+        Err(DesktopError::new("UNAVAILABLE", "lost")),
+    );
     let out = run(&mut unknown, input.into_bytes(), 4096);
     std::fs::remove_dir_all(&directory).unwrap();
     assert_eq!(out[2]["error"]["outcome_unknown"], true);
-    assert_eq!(out[2]["error"]["detail"]["resource_id"], "00000000-0000-0000-0000-0000000000f1");
+    assert_eq!(
+        out[2]["error"]["detail"]["resource_id"],
+        "00000000-0000-0000-0000-0000000000f1"
+    );
 }
 
 #[test]
@@ -314,8 +395,12 @@ fn non_images_and_mismatched_types_are_refused_before_any_request() {
 }
 
 fn publish_line(wait: u64) -> String {
-    request("pub", "product.publish", json!({"enterprise": ENTERPRISE, "site": SITE, "product": PRODUCT,
-        "operation_id": OPERATION, "expected_revision": 4, "wait_seconds": wait}))
+    request(
+        "pub",
+        "product.publish",
+        json!({"enterprise": ENTERPRISE, "site": SITE, "product": PRODUCT,
+        "version": 1, "operation_id": OPERATION, "expected_revision": 4, "wait_seconds": wait}),
+    )
 }
 
 fn receipt(status: &str) -> Reply {
@@ -346,6 +431,7 @@ fn failed_publication_is_an_error_and_a_timeout_is_unknown_not_success() {
     let out = run(&mut failed, input.into_bytes(), 4096);
     assert_eq!(out[2]["error"]["code"], "PUBLISH_FAILED");
     assert_eq!(out[2]["error"]["outcome_unknown"], false);
+    assert_eq!(out[2]["error"]["detail"]["publication"]["status"], "FAILED");
 
     let mut slow = Script::default();
     slow.reply("Client.NeoCMS.Product.Publish", receipt("PENDING_ACK"));
@@ -357,27 +443,50 @@ fn failed_publication_is_an_error_and_a_timeout_is_unknown_not_success() {
     assert_eq!(out[2]["error"]["code"], "PUBLISH_PENDING");
     assert_eq!(out[2]["error"]["outcome_unknown"], true);
     assert_eq!(out[2]["error"]["detail"]["task_id"], TASK);
+    assert_eq!(
+        out[2]["error"]["detail"]["publication"]["status"],
+        "ACTIVATING"
+    );
 }
 
 #[test]
 fn quit_disconnects_but_keeps_the_saved_session_and_stops_reading() {
     let mut script = Script::default();
-    let login = request("login", "auth.login", json!({"base_url": "https://api.example.test", "phone": "+15555550100",
-        "code": "123456", "session_file": "C:/Users/测试 用户/session.dat"}));
-    let input = [login, request("q", "session.quit", json!({})), request("late", "session.ping", json!({}))].concat();
+    let login = request(
+        "login",
+        "auth.login",
+        json!({"base_url": "https://api.example.test", "phone": "+15555550100",
+        "code": "123456", "session_file": "C:/Users/测试 用户/session.dat"}),
+    );
+    let input = [
+        login,
+        request("q", "session.quit", json!({})),
+        request("late", "session.ping", json!({})),
+    ]
+    .concat();
     let out = run(&mut script, input.into_bytes(), 4096);
     assert_eq!(out.last().unwrap()["id"], "q");
     assert!(!script.authenticated);
     assert_eq!(script.disconnects, 1);
-    assert!(script.cleared.is_empty(), "closing must not forget the login");
-    assert_eq!(script.saved, Some(PathBuf::from("C:/Users/测试 用户/session.dat")));
+    assert!(
+        script.cleared.is_empty(),
+        "closing must not forget the login"
+    );
+    assert_eq!(
+        script.saved,
+        Some(PathBuf::from("C:/Users/测试 用户/session.dat"))
+    );
 }
 
 #[test]
 fn losing_the_peer_without_quit_also_only_disconnects() {
     let mut script = Script::default();
-    let login = request("login", "auth.login", json!({"base_url": "https://api.example.test", "phone": "+15555550100",
-        "code": "123456", "session_file": "/tmp/s.dat"}));
+    let login = request(
+        "login",
+        "auth.login",
+        json!({"base_url": "https://api.example.test", "phone": "+15555550100",
+        "code": "123456", "session_file": "/tmp/s.dat"}),
+    );
     run(&mut script, login.into_bytes(), 4096); // input ends: stdin closed
     assert_eq!(script.disconnects, 1);
     assert!(script.cleared.is_empty());
@@ -397,9 +506,17 @@ fn login_without_a_session_file_keeps_the_old_call_working() {
 fn restore_needs_a_session_file_and_passes_backend_device_and_path() {
     let mut script = Script::default();
     let input = [
-        request("bad", "auth.restore", json!({"base_url": "https://api.example.test"})),
-        request("r", "auth.restore", json!({"base_url": "https://api.example.test", "device": "dev-1",
-            "session_file": "C:/数据 目录/session.dat"})),
+        request(
+            "bad",
+            "auth.restore",
+            json!({"base_url": "https://api.example.test"}),
+        ),
+        request(
+            "r",
+            "auth.restore",
+            json!({"base_url": "https://api.example.test", "device": "dev-1",
+            "session_file": "C:/数据 目录/session.dat"}),
+        ),
         request("e", "enterprise.list", json!({})),
     ]
     .concat();
@@ -407,21 +524,38 @@ fn restore_needs_a_session_file_and_passes_backend_device_and_path() {
     assert_eq!(out[1]["error"]["code"], "BAD_REQUEST");
     assert_eq!(out[2]["ok"], true);
     assert_eq!(out[2]["data"]["restored"], true);
-    assert_eq!(out[3]["ok"], true, "calls work after a restore without any code or login");
+    assert_eq!(
+        out[3]["ok"], true,
+        "calls work after a restore without any code or login"
+    );
     assert_eq!(script.logins, 0);
     assert_eq!(
         script.restores,
-        vec![("https://api.example.test".into(), "dev-1".into(), PathBuf::from("C:/数据 目录/session.dat"))]
+        vec![(
+            "https://api.example.test".into(),
+            "dev-1".into(),
+            PathBuf::from("C:/数据 目录/session.dat")
+        )]
     );
 }
 
 #[test]
 fn restore_failures_keep_their_codes_and_leave_the_bridge_unauthenticated() {
-    for code in ["NO_SESSION", "SESSION_CORRUPT", "SESSION_MISMATCH", "SESSION_EXPIRED", "SESSION_OFFLINE"] {
+    for code in [
+        "NO_SESSION",
+        "SESSION_CORRUPT",
+        "SESSION_MISMATCH",
+        "SESSION_EXPIRED",
+        "SESSION_OFFLINE",
+    ] {
         let mut script = Script::default();
         script.restore_failure = Some(DesktopError::new(code, "x"));
         let input = [
-            request("r", "auth.restore", json!({"base_url": "https://api.example.test", "session_file": "/tmp/s.dat"})),
+            request(
+                "r",
+                "auth.restore",
+                json!({"base_url": "https://api.example.test", "session_file": "/tmp/s.dat"}),
+            ),
             request("e", "enterprise.list", json!({})),
         ]
         .concat();
@@ -449,7 +583,11 @@ fn logout_clears_the_named_session_and_reports_a_failed_removal() {
 
     let mut failing = Script::default();
     failing.logout_failure = Some(DesktopError::new("SESSION_CLEAR_FAILED", "locked"));
-    let out = run(&mut failing, request("o", "auth.logout", json!({})).into_bytes(), 4096);
+    let out = run(
+        &mut failing,
+        request("o", "auth.logout", json!({})).into_bytes(),
+        4096,
+    );
     assert_eq!(out[1]["error"]["code"], "SESSION_CLEAR_FAILED");
 }
 
@@ -496,7 +634,10 @@ fn credentials(device: &str) -> Credentials {
 }
 
 fn file_in(dir: &Path) -> SessionFile {
-    SessionFile::new(dir.join("数据 目录").join("session.dat"), Arc::new(Xor(0x5a)))
+    SessionFile::new(
+        dir.join("数据 目录").join("session.dat"),
+        Arc::new(Xor(0x5a)),
+    )
 }
 
 #[test]
@@ -505,7 +646,10 @@ fn saved_session_round_trips_without_plaintext_and_leaves_no_temp_file() {
     let file = file_in(&dir);
     file.save(BASE, &credentials(DEVICE)).unwrap();
     let raw = std::fs::read_to_string(dir.join("数据 目录").join("session.dat")).unwrap();
-    assert!(!raw.contains(&"ab".repeat(32)) && !raw.contains(BASE) && !raw.contains(DEVICE), "{raw}");
+    assert!(
+        !raw.contains(&"ab".repeat(32)) && !raw.contains(BASE) && !raw.contains(DEVICE),
+        "{raw}"
+    );
     let loaded = file.load(&format!("{BASE}/"), DEVICE).unwrap();
     assert!(loaded == credentials(DEVICE));
     let leftovers: Vec<_> = std::fs::read_dir(dir.join("数据 目录")).unwrap().collect();
@@ -518,9 +662,18 @@ fn another_backend_or_device_is_a_mismatch_and_the_file_is_kept() {
     let dir = scratch();
     let file = file_in(&dir);
     file.save(BASE, &credentials(DEVICE)).unwrap();
-    assert_eq!(file.load("https://other.example.test", DEVICE).err(), Some(SessionFileError::Mismatch));
-    assert_eq!(file.load(BASE, "another-device").err(), Some(SessionFileError::Mismatch));
-    assert!(file.load(BASE, DEVICE).is_ok(), "a mismatch must not destroy the saved login");
+    assert_eq!(
+        file.load("https://other.example.test", DEVICE).err(),
+        Some(SessionFileError::Mismatch)
+    );
+    assert_eq!(
+        file.load(BASE, "another-device").err(),
+        Some(SessionFileError::Mismatch)
+    );
+    assert!(
+        file.load(BASE, DEVICE).is_ok(),
+        "a mismatch must not destroy the saved login"
+    );
     std::fs::remove_dir_all(dir).unwrap();
 }
 
@@ -528,7 +681,10 @@ fn another_backend_or_device_is_a_mismatch_and_the_file_is_kept() {
 fn missing_and_damaged_files_are_told_apart() {
     let dir = scratch();
     let file = file_in(&dir);
-    assert_eq!(file.load(BASE, DEVICE).err(), Some(SessionFileError::Missing));
+    assert_eq!(
+        file.load(BASE, DEVICE).err(),
+        Some(SessionFileError::Missing)
+    );
     file.save(BASE, &credentials(DEVICE)).unwrap();
     let path = dir.join("数据 目录").join("session.dat");
     let good = std::fs::read_to_string(&path).unwrap();
@@ -541,15 +697,26 @@ fn missing_and_damaged_files_are_told_apart() {
         r#"{"format":1,"data":"!!!"}"#.to_owned(),
     ] {
         std::fs::write(&path, &broken).unwrap();
-        assert_eq!(file.load(BASE, DEVICE).err(), Some(SessionFileError::Corrupt), "{broken}");
+        assert_eq!(
+            file.load(BASE, DEVICE).err(),
+            Some(SessionFileError::Corrupt),
+            "{broken}"
+        );
     }
     std::fs::write(&path, &good).unwrap();
-    assert_eq!(other_key.load(BASE, DEVICE).err(), Some(SessionFileError::Corrupt), "wrong key reads as damaged");
+    assert_eq!(
+        other_key.load(BASE, DEVICE).err(),
+        Some(SessionFileError::Corrupt),
+        "wrong key reads as damaged"
+    );
     // a payload that decrypts but carries invalid credentials is also damaged
     let mut bad = credentials(DEVICE);
     bad.token = "short".into();
     file.save(BASE, &bad).unwrap();
-    assert_eq!(file.load(BASE, DEVICE).err(), Some(SessionFileError::Corrupt));
+    assert_eq!(
+        file.load(BASE, DEVICE).err(),
+        Some(SessionFileError::Corrupt)
+    );
     std::fs::remove_dir_all(dir).unwrap();
 }
 
@@ -560,7 +727,10 @@ fn clear_removes_the_file_and_is_idempotent() {
     file.save(BASE, &credentials(DEVICE)).unwrap();
     file.clear().unwrap();
     file.clear().unwrap();
-    assert_eq!(file.load(BASE, DEVICE).err(), Some(SessionFileError::Missing));
+    assert_eq!(
+        file.load(BASE, DEVICE).err(),
+        Some(SessionFileError::Missing)
+    );
     std::fs::remove_dir_all(dir).unwrap();
 }
 
@@ -576,7 +746,10 @@ fn store_mirrors_login_to_the_file_and_the_sdk_clear_removes_it() {
     assert!(store.load().unwrap().is_some());
     store.clear().unwrap(); // what the SDK does when the server rejects the credentials
     assert!(store.load().unwrap().is_none());
-    assert_eq!(file.load(BASE, DEVICE).err(), Some(SessionFileError::Missing));
+    assert_eq!(
+        file.load(BASE, DEVICE).err(),
+        Some(SessionFileError::Missing)
+    );
     std::fs::remove_dir_all(dir).unwrap();
 }
 
@@ -588,10 +761,20 @@ fn a_failed_write_keeps_the_login_alive_reports_it_and_drops_the_stale_file() {
     let broken = SessionFile::new(dir.join("数据 目录").join("session.dat"), Arc::new(Broken));
     let store = PersistingStore::with_file(broken, BASE);
     store.save(&credentials(DEVICE)).unwrap();
-    assert!(store.take_failure().is_some(), "the caller must be able to tell the login was not persisted");
+    assert!(
+        store.take_failure().is_some(),
+        "the caller must be able to tell the login was not persisted"
+    );
     assert!(store.take_failure().is_none());
-    assert!(store.load().unwrap().is_some(), "the running session is unaffected");
-    assert_eq!(good.load(BASE, DEVICE).err(), Some(SessionFileError::Missing), "an older account must not come back");
+    assert!(
+        store.load().unwrap().is_some(),
+        "the running session is unaffected"
+    );
+    assert_eq!(
+        good.load(BASE, DEVICE).err(),
+        Some(SessionFileError::Missing),
+        "an older account must not come back"
+    );
     std::fs::remove_dir_all(dir).unwrap();
 }
 
@@ -620,21 +803,96 @@ fn restore_distinguishes_rejected_credentials_from_being_offline() {
     assert_eq!(code(Status::Offline, false), "WAIT");
     assert_eq!(code(Status::Offline, true), "SESSION_OFFLINE");
     assert_eq!(code(Status::Connecting, true), "SESSION_OFFLINE");
-    assert!(!restore_outcome(Status::Offline, true).unwrap().unwrap_err().outcome_unknown);
+    assert!(
+        !restore_outcome(Status::Offline, true)
+            .unwrap()
+            .unwrap_err()
+            .outcome_unknown
+    );
 }
 
 #[test]
 fn session_errors_map_to_stable_protocol_codes() {
     assert_eq!(session_error(SessionFileError::Missing).code, "NO_SESSION");
-    assert_eq!(session_error(SessionFileError::Corrupt).code, "SESSION_CORRUPT");
-    assert_eq!(session_error(SessionFileError::Mismatch).code, "SESSION_MISMATCH");
-    assert_eq!(session_error(SessionFileError::Io("x".into())).code, "SESSION_STORAGE");
+    assert_eq!(
+        session_error(SessionFileError::Corrupt).code,
+        "SESSION_CORRUPT"
+    );
+    assert_eq!(
+        session_error(SessionFileError::Mismatch).code,
+        "SESSION_MISMATCH"
+    );
+    assert_eq!(
+        session_error(SessionFileError::Io("x".into())).code,
+        "SESSION_STORAGE"
+    );
 }
 
 #[test]
 fn image_sniffing_accepts_only_jpeg_png_webp() {
     assert_eq!(sniff_image(&png()), Some("image/png"));
     assert_eq!(sniff_image(&[0xff, 0xd8, 0xff, 0xe0]), Some("image/jpeg"));
-    assert_eq!(sniff_image(b"RIFF\x00\x00\x00\x00WEBPVP8 "), Some("image/webp"));
+    assert_eq!(
+        sniff_image(b"RIFF\x00\x00\x00\x00WEBPVP8 "),
+        Some("image/webp")
+    );
     assert_eq!(sniff_image(b"GIF89a"), None);
+}
+
+fn enterprise_receipt(status: &str) -> Reply {
+    let node = if status == "COMMITTED" {
+        "COMMITTED"
+    } else {
+        "PENDING"
+    };
+    Ok(
+        json!({"version":2,"enterprise_id":ENTERPRISE,"product_id":PRODUCT,"task_id":OPERATION,"operation_id":OPERATION,"product_revision":4,"status":status,"target_sites":1,"target_nodes":1,"sites":[{"site_id":SITE,"task_id":TASK,"publication_id":PRODUCT,"revision":2,"status":status,"target_nodes":1,"activated_nodes":if status=="COMMITTED" {1} else {0},"nodes":[{"node_id":SITE,"status":node}]}]}),
+    )
+}
+
+#[test]
+fn enterprise_publish_ignores_old_site_parameter_and_validates_parent_receipt() {
+    let mut script = Script::default();
+    script
+        .reply(
+            "Client.NeoCMS.Product.Publish",
+            enterprise_receipt("DELIVERING"),
+        )
+        .reply(
+            "Client.NeoCMS.Product.PublishStatus",
+            enterprise_receipt("COMMITTED"),
+        );
+    let input=[login_line(),request("v2","product.publish",json!({"enterprise":ENTERPRISE,"site":"retired-site","product":PRODUCT,"operation_id":OPERATION,"expected_revision":4,"wait_seconds":30}))].concat();
+    let out = run(&mut script, input.into_bytes(), 4096);
+    assert_eq!(out[2]["ok"], true);
+    for (_, _, body) in script
+        .calls
+        .iter()
+        .filter(|(action, _, _)| action.starts_with("Client.NeoCMS.Product.Publish"))
+    {
+        assert_eq!(body["version"], 2);
+        assert!(body.get("site_id").is_none());
+    }
+}
+
+#[test]
+fn enterprise_sync_status_validates_receipt_without_product_or_site() {
+    let mut script = Script::default();
+    let mut receipt = enterprise_receipt("COMMITTED").unwrap();
+    receipt["product_id"] = Value::Null;
+    receipt["product_revision"] = json!(0);
+    script.reply("Client.NeoCMS.Product.PublishStatus", Ok(receipt.clone()));
+    receipt["target_nodes"] = json!(99);
+    script.reply("Client.NeoCMS.Product.PublishStatus", Ok(receipt));
+    let args = json!({"enterprise":ENTERPRISE,"task":OPERATION});
+    let input = [
+        login_line(),
+        request("status", "product.publish_status", args.clone()),
+        request("bad", "product.publish_status", args),
+    ]
+    .concat();
+    let out = run(&mut script, input.into_bytes(), 4096);
+    assert_eq!(out[2]["ok"], true);
+    assert_eq!(out[3]["error"]["code"], "BAD_RESPONSE");
+    assert_eq!(script.calls[0].2, json!({"version":2,"task_id":OPERATION}));
 }

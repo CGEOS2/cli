@@ -820,10 +820,17 @@ impl Gateway for LiveGateway {
                 other => Err(other),
             })
             .map_err(|code| {
-                DesktopError::new(
-                    "LOGIN_FAILED",
-                    format!("request code failed: {}", code_name_login(&code)),
-                )
+                let msg = match code {
+                    Code::InvalidRequest => {
+                        "手机号格式不正确或请求参数无效 (InvalidRequest)".to_string()
+                    }
+                    Code::Busy => "请求过于频繁，请稍后重试 (Busy)".to_string(),
+                    Code::Unavailable => {
+                        "认证服务暂时不可用，请稍后重试 (Unavailable)".to_string()
+                    }
+                    other => format!("request code failed: {}", code_name_login(&other)),
+                };
+                DesktopError::new("LOGIN_FAILED", msg)
             })
     }
 
@@ -849,10 +856,14 @@ impl Gateway for LiveGateway {
         let credentials = client
             .login(challenge, code, device, ClientKind::Web, store.as_ref())
             .map_err(|code| {
-                DesktopError::new(
-                    "LOGIN_FAILED",
-                    format!("login failed: {}", code_name_login(&code)),
-                )
+                let msg = match code {
+                    Code::Unauthorized => "验证码错误或已失效 (Unauthorized)".to_string(),
+                    Code::InvalidRequest => "验证码或参数格式无效 (InvalidRequest)".to_string(),
+                    Code::Busy => "系统繁忙，请稍后重试 (Busy)".to_string(),
+                    Code::Unavailable => "认证服务暂时不可用 (Unavailable)".to_string(),
+                    other => format!("login failed: {}", code_name_login(&other)),
+                };
+                DesktopError::new("LOGIN_FAILED", msg)
             })?;
         let addresses = resolve_terminal_address(base_url)
             .map_err(|_| DesktopError::new("UNAVAILABLE", "cannot resolve API host"))?;

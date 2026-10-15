@@ -814,11 +814,7 @@ impl Gateway for LiveGateway {
     ) -> std::result::Result<String, DesktopError> {
         let client = login_client(base_url)?;
         client
-            .request_code_with_pow(phone)
-            .or_else(|code| match code {
-                Code::Unavailable => client.request_code(phone),
-                other => Err(other),
-            })
+            .request_code_auto(phone)
             .map_err(|code| {
                 let msg = match code {
                     Code::InvalidRequest => {

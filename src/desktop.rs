@@ -813,12 +813,18 @@ impl Gateway for LiveGateway {
         phone: &str,
     ) -> std::result::Result<String, DesktopError> {
         let client = login_client(base_url)?;
-        client.request_code(phone).map_err(|code| {
-            DesktopError::new(
-                "LOGIN_FAILED",
-                format!("request code failed: {}", code_name_login(&code)),
-            )
-        })
+        client
+            .request_code_with_pow(phone)
+            .or_else(|code| match code {
+                Code::Unavailable => client.request_code(phone),
+                other => Err(other),
+            })
+            .map_err(|code| {
+                DesktopError::new(
+                    "LOGIN_FAILED",
+                    format!("request code failed: {}", code_name_login(&code)),
+                )
+            })
     }
 
     fn login(

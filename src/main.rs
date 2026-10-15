@@ -8,7 +8,7 @@ use cgeos_access_service::{
 use cgeos_sdk_shared::host::SessionStore;
 use cgeos_sdk_shared::login::{AuthEndpoint, LoginClient};
 use cgeos_sdk_shared::native::{Runtime, Status};
-use cgeos_sdk_shared::protocol::{Action, ClientKind, Credentials, Outcome, Request};
+use cgeos_sdk_shared::protocol::{Action, ClientKind, Code, Credentials, Outcome, Request};
 use clap::{Args, Parser, Subcommand};
 use serde_json::{json, Value};
 use std::io::{IsTerminal, Read};
@@ -528,7 +528,11 @@ fn run_client(command: ClientCommand) -> Result<Value> {
             let client = LoginClient::new(endpoint)
                 .map_err(|code| anyhow!("cannot create login client: {code:?}"))?;
             let challenge = client
-                .request_code(&phone)
+                .request_code_with_pow(&phone)
+                .or_else(|code| match code {
+                    Code::Unavailable => client.request_code(&phone),
+                    other => Err(other),
+                })
                 .map_err(|code| anyhow!("request code failed: {code:?}"))?;
             Ok(json!({"challenge": challenge, "expires_by_server_policy": true}))
         }
@@ -941,13 +945,19 @@ fn authenticated_runtime(auth: &AuthenticationArgs) -> Result<Runtime> {
 fn login_material(client: &LoginClient, auth: &AuthenticationArgs) -> Result<(String, String)> {
     let challenge = match auth.challenge {
         Some(value) => value.to_string(),
-        None => client
-            .request_code(
-                auth.phone
-                    .as_deref()
-                    .context("phone is required without challenge")?,
-            )
-            .map_err(|value| anyhow!("request code failed: {value:?}"))?,
+        None => {
+            let phone = auth
+                .phone
+                .as_deref()
+                .context("phone is required without challenge")?;
+            client
+                .request_code_with_pow(phone)
+                .or_else(|code| match code {
+                    Code::Unavailable => client.request_code(phone),
+                    other => Err(other),
+                })
+                .map_err(|value| anyhow!("request code failed: {value:?}"))?
+        }
     };
     let code = if auth.code_stdin {
         read_code(&mut std::io::stdin())?

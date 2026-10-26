@@ -81,7 +81,7 @@ token 不打印。账号及验证码由获授权的调试环境提供，仓库�
 
 CLI 源码使用 MIT；链接的 CGEOS2 服务 crate 与第三方组件继续使用各自许可证。
 
-上传边界：`client media-upload` 与桌面模式的 `media.upload` 使用内置 Rust HTTP 客户端（ureq，系统根证书，不跟随重定向），不再依赖 PATH 中的 curl。读取至多 20 MiB 的普通文件快照，PUT 和 Confirm 摘要使用同一字节；连接 10 秒、总计 120 秒、读写停滞 30 秒时失败；签名地址须为 https（仅回环地址允许 http 以便测试）。签名 URL、供应商响应及凭据不写入错误或日志。PUT 或 Confirm 失败返回非零，不能据此声称资源已确认；需通过资源查询核实后恢复。登录/OTP 的交互等待独立于上传时限。
+上传边界：`client media-upload` 与桌面模式的 `media.upload` 使用内置 Rust HTTP 客户端（ureq，系统根证书，不跟随重定向），不再依赖 PATH 中的 curl。读取至多 20 MiB 的普通文件快照，PUT 和 Confirm 摘要使用同一字节；连接 10 秒、总计 120 秒、读写停滞 30 秒时失败；签名地址须为 https（仅回环地址允许 http 以便测试）。presign 必需头在发送前校验字段名和值，拒绝控制字符以避免请求结构被改变。签名 URL、供应商响应及凭据不写入错误或日志。PUT 或 Confirm 失败返回非零，不能据此声称资源已确认；需通过资源查询核实后恢复。登录/OTP 的交互等待独立于上传时限。
 
 当前 `access version/init/validate-inquiry/digest` 是本地核心检查，不替代 v1 访客部署联测；Agent 专用命令未覆盖原流式便利接口，通用 call 仅能访问已登记且授权的动作。Linux 本地测试不代表其他原生宿主发行验收。
 

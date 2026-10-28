@@ -85,6 +85,30 @@ CLI 源码使用 MIT；链接的 CGEOS2 服务 crate 与第三方组件继续使
 
 当前 `access version/init/validate-inquiry/digest` 是本地核心检查，不替代 v1 访客部署联测；Agent 专用命令未覆盖原流式便利接口，通用 call 仅能访问已登记且授权的动作。Linux 本地测试不代表其他原生宿主发行验收。
 
+### 加密边界审计（2026-10-28）
+
+- `access init --encryption --device-consent` **只输出本地初始化计划**，不会建立 Protect 会话、
+  生成设备指纹、交换密钥或加解密内容，也不会修改站点或客户端配置。三个开关缺省均为 `false`。
+  `--encryption` 仅控制计划中的 `session`；`--device-consent` 控制 `device`；
+  只有设备同意与 `--advanced-consent` 同时为真时才计划详细分析。拒绝设备收集不禁止内容加密，
+  无设备同意时计划要求交互挑战。此 CLI 简化入口假设设备能力可用，不探测真实浏览器。
+- `client login/call` 与桌面 `auth.login/restore` 复用 SDK native 登录和 Terminal：
+  非回环认证地址要求 HTTPS，Terminal 要求 WSS，以系统信任根验证 TLS；
+  SDK 的显式回环调试地址可使用 HTTP/WS。当前发送的是 TLS 内的 Terminal JSON 文本，
+  **没有另启用应用层 AEAD/X25519/AES/ChaCha 加密协议**，`access init` 的开关不作用于这些连接。
+  `client build` 只生成协议请求，不建立受保护连接。CLI 当前还编译 SDK `debug-pass` 特性；
+  它不是加密开关，不代表远端服务已启用调试登录。
+- 桌面保存会话仅 Windows 使用当前用户范围 DPAPI（固定用途 entropy、禁止 UI、非机器范围），
+  后台地址与设备标识位于受保护载荷内，恢复时核对；非 Windows 仅内存存储，不降级成明文文件。
+  Linux 既有会话测试使用可逆 XOR 测试保护器，只证明文件封装、绑定检查、损坏处理与清除逻辑，
+  **不能作为 DPAPI 强度、密文认证或 Windows 原生 API 实测证据**。
+- 实测：在 CLI 仓库执行 `cargo test --offline --locked`，基线 40 项全部通过；
+  新增八种 `access init` 开关组合的解析与输出断言后再次执行，41 项全部通过（0 失败、0 忽略）。
+  新断言锁定计划语义及同意/加密解耦，不把 `session=true` 当作已建立加密会话。
+  审计未发现需要修改 CLI 加密实现的明确缺陷。
+  未覆盖真实 TLS 握手/证书拒绝、Portal/Outpost 密钥交换与密文互通、Windows DPAPI、
+  浏览器/设备及线上配置状态；未部署或修改任何服务端配置。
+
 ## 桌面常驻模式
 
 `cgeos2 client desktop --stdio` 供 Windows 商品图像工作台（`../image-workbench`）通过子进程调用：

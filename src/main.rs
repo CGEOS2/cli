@@ -1092,6 +1092,41 @@ mod tests {
     use super::*;
 
     #[test]
+    fn access_init_flags_only_plan_independent_encryption_and_consent() {
+        for encryption in [false, true] {
+            for device_consent in [false, true] {
+                for advanced_consent in [false, true] {
+                    let mut args = vec!["cgeos2", "access", "init"];
+                    if encryption {
+                        args.push("--encryption");
+                    }
+                    if device_consent {
+                        args.push("--device-consent");
+                    }
+                    if advanced_consent {
+                        args.push("--advanced-consent");
+                    }
+                    let cli = Cli::try_parse_from(args).unwrap();
+                    let Command::Access(access) = cli.command else {
+                        panic!("expected access command");
+                    };
+                    let result = run_access(access.command).unwrap();
+                    assert_eq!(
+                        result,
+                        json!({"plan": format!(
+                            "device={};session={};detailed_analytics={};interactive_challenge={}",
+                            device_consent,
+                            encryption,
+                            device_consent && advanced_consent,
+                            !device_consent,
+                        )}),
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn upload_uses_frozen_bytes_after_source_path_is_replaced() {
         use std::net::TcpListener;
         let path = std::env::temp_dir().join(format!("cgeos-upload-{}", Uuid::new_v4()));
